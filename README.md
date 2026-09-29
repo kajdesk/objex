@@ -4,7 +4,7 @@ A fast, lightweight, S3 / Cloudflare R2 compatible object storage server written
 
 objex ships as a single static binary. It runs as a single node today, and its storage layer is designed so it can grow into an erasure-coded distributed cluster without changing the S3 API layer.
 
-> **Status:** early development. The single-node engine is being built; see [Roadmap](#roadmap).
+> **Status:** early development. The single-node server implements the full first-release API; see [Roadmap](#roadmap).
 
 ## Features
 
@@ -62,10 +62,17 @@ secret_key = "..."
 Key management:
 
 ```sh
-objex key add <name>     # generate a new key pair
+objex key add <name>                          # generate a new key pair
+objex key add <name> --bucket photos --read-only  # restrict to buckets, reads only
 objex key list
-objex key rm <access-key>
+objex key rm <access-key-or-name>
 ```
+
+A running server picks up key changes within a couple of seconds; no restart is needed.
+
+Buckets are private by default. A bucket created with the `public-read` canned ACL (or switched with `PutBucketAcl`) also serves anonymous `GET`, `HEAD`, and listing requests.
+
+Logging is controlled with `OBJEX_LOG` (for example `OBJEX_LOG=debug`, or `OBJEX_LOG=info,objex::access=off` to silence the access log).
 
 ## Architecture
 
@@ -96,13 +103,21 @@ The S3 API layer does not change.
 
 ## Roadmap
 
-- [ ] Single-node engine (redb + blob files)
-- [ ] Full SigV4 (header, presigned, streaming chunked + trailers)
-- [ ] Core bucket and object API, ListObjects V1/V2
-- [ ] Multipart upload, copy, Range, conditional requests
-- [ ] Checksums (CRC32/CRC32C/CRC64NVME/SHA1/SHA256)
-- [ ] Bucket CORS
+- [x] Single-node engine (redb + blob files)
+- [x] Full SigV4 (header, presigned, streaming chunked + trailers)
+- [x] Core bucket and object API, ListObjects V1/V2
+- [x] Multipart upload, copy, Range, conditional requests
+- [x] Checksums (CRC32/CRC32C/CRC64NVME/SHA1/SHA256)
+- [x] Bucket CORS
 - [ ] Erasure-coded distributed mode
 - [ ] Versioning, tagging, lifecycle
+
+## Development
+
+```sh
+cargo test
+```
+
+The test suite includes end-to-end tests that start a real server and drive it with the official `aws-sdk-s3` crate, plus hand-built `aws-chunked` uploads for the streaming signature modes.
 
 Not planned for the first release: versioning, tagging, lifecycle rules, object lock, SSE, bucket policies, and SigV2.
