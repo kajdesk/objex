@@ -13,7 +13,10 @@ RUN mkdir -p /out/data /out/config && chown -R 65532:65532 /out
 
 # ---- runtime ----
 FROM gcr.io/distroless/cc-debian12:nonroot
+LABEL org.opencontainers.image.licenses="Elastic-2.0" \
+      org.opencontainers.image.source="https://github.com/kajdesk/objex"
 COPY --from=build /objex /usr/local/bin/objex
+COPY LICENSE NOTICE /usr/share/doc/objex/
 COPY --from=build --chown=65532:65532 /out/data /data
 COPY --from=build --chown=65532:65532 /out/config /config
 

@@ -2,6 +2,10 @@
 name = "objex"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+license = "Elastic-2.0"
+description = "A fast, lightweight, S3 / Cloudflare R2 compatible object storage server"
+repository = "https://github.com/kajdesk/objex"
 
 [dependencies]
 async-trait = "0.1.92"
