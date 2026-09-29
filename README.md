@@ -234,3 +234,12 @@ cargo test
 The test suite includes end-to-end tests that start a real server and drive it with the official `aws-sdk-s3` crate, plus hand-built `aws-chunked` uploads for the streaming signature modes.
 
 Not planned for the first release: versioning, tagging, lifecycle rules, object lock, SSE, bucket policies, and SigV2.
+
+## License
+
+objex is source-available under the [Elastic License 2.0](LICENSE). Copyright 2026 kajdesk.
+
+- **You can** use, modify, and run it for free, for any purpose, including in commercial products and as the storage for your own applications and backend systems.
+- **You cannot** offer objex to others as a hosted or managed service, remove the license or copyright notices, or distribute modified copies without marking them as modified.
+
+This is not an OSI-approved open-source license. To offer objex as a service, or for other terms, contact kajdesk.
