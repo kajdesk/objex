@@ -1,0 +1,63 @@
+# objex alongside an application, with buckets created on startup.
+#
+#   cp .env.example .env        # then set real keys
+#   docker compose up -d
+#   docker compose --profile test run --rm smoke-test   # optional end-to-end check
+#
+# Inside this network the endpoint is http://objex:9000; from the host it is
+# http://localhost:9000.
+
+services:
+  objex:
+    image: ${OBJEX_IMAGE:-ghcr.io/kajdesk/objex:latest}
+    restart: unless-stopped
+    environment:
+      OBJEX_ACCESS_KEY: ${OBJEX_ACCESS_KEY:?set OBJEX_ACCESS_KEY in .env}
+      OBJEX_SECRET_KEY: ${OBJEX_SECRET_KEY:?set OBJEX_SECRET_KEY in .env}
+      OBJEX_REGION: auto
+    volumes:
+      - objex-data:/data       # object data and metadata
+      - objex-config:/config   # objex.toml, for keys added with `objex key add`
+    ports:
+      - "9000:9000"            # drop this if only other containers need access
+    stop_grace_period: 30s     # lets in-flight uploads finish on shutdown
+    # The image has a built-in healthcheck (`objex health`).
+
+  # One-shot job: create the buckets the app expects (safe to re-run).
+  create-buckets:
+    image: amazon/aws-cli:latest
+    depends_on:
+      objex:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${OBJEX_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${OBJEX_SECRET_KEY}
+      AWS_DEFAULT_REGION: auto
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        s3() { aws --endpoint-url http://objex:9000 "$$@"; }
+        s3 s3api create-bucket --bucket uploads 2>/dev/null || echo "uploads exists"
+        s3 s3api create-bucket --bucket public --acl public-read 2>/dev/null || echo "public exists"
+        s3 s3 ls
+
+  # Example application: an end-to-end check using boto3.
+  smoke-test:
+    profiles: ["test"]
+    image: python:3.12-slim
+    depends_on:
+      create-buckets:
+        condition: service_completed_successfully
+    environment:
+      S3_ENDPOINT: http://objex:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_ACCESS_KEY: ${OBJEX_ACCESS_KEY}
+      S3_SECRET_KEY: ${OBJEX_SECRET_KEY}
+    volumes:
+      - ./smoke_test.py:/smoke_test.py:ro
+    command: ["sh", "-c", "pip install --quiet --root-user-action=ignore boto3 && python /smoke_test.py"]
+
+volumes:
+  objex-data:
+  objex-config:

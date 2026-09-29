@@ -1,0 +1,9 @@
+# Build output and local state
+target/
+data/
+.git/
+# Never bake local credentials into an image
+objex.toml
+*.toml.tmp
+*.md
+!README.md

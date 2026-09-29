@@ -19,18 +19,54 @@ objex ships as a single static binary. It runs as a single node today, and its s
 - **Durable by default**: data and metadata are flushed to disk before a write is acknowledged (see [Durability](#durability)). Pass `--no-fsync` to trade durability for speed.
 - **Integrity checked**: every blob carries an internal CRC32C. Full reads are verified before the last bytes are sent, and a background scrub re-checks everything weekly (`objex scrub` does it offline).
 
+## Install
+
+objex is a single self-contained program. Run it as a Docker image, as a downloaded binary, or build it from source.
+
+### Docker
+
+```sh
+docker run -d --name objex -p 9000:9000 \
+  -e OBJEX_ACCESS_KEY=OBXCHANGEME000000001 \
+  -e OBJEX_SECRET_KEY=change-me-to-a-long-random-secret \
+  -v objex-data:/data \
+  ghcr.io/kajdesk/objex:latest
+```
+
+The image is multi-arch (`linux/amd64`, `linux/arm64`), about 45 MB, runs as a non-root user, and has a built-in healthcheck. Images are published for each release tag (`:latest`, `:1.2.3`, `:1.2`).
+
+| Path / port | Purpose |
+|---|---|
+| `9000` | S3 API |
+| `/data` | Object data and metadata. Mount a volume here. |
+| `/config/objex.toml` | Optional config file. Mount a volume on `/config` to keep keys added with `docker exec objex objex key add <name>`. |
+
+### Prebuilt binary
+
+Each [release](https://github.com/kajdesk/objex/releases) has archives for Linux (x86_64, arm64; statically linked, no dependencies) and macOS (Apple Silicon, Intel), each with a `.sha256` checksum.
+
+```sh
+VERSION=v0.1.0
+TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
+curl -LO https://github.com/kajdesk/objex/releases/download/$VERSION/objex-$VERSION-$TARGET.tar.gz
+tar xzf objex-$VERSION-$TARGET.tar.gz
+sudo install objex-$VERSION-$TARGET/objex /usr/local/bin/
+```
+
+### From source
+
+Requires Rust 1.89 or newer.
+
+```sh
+cargo build --release   # produces target/release/objex
+```
+
 ## Quick start
 
 ```sh
-# build
-cargo build --release
-
-# create a config and an access key
-./target/release/objex init                # writes objex.toml
-./target/release/objex key add admin       # prints access key + secret
-
-# run
-./target/release/objex server --data ./data --listen 0.0.0.0:9000
+objex init                                 # writes objex.toml
+objex key add admin                        # prints an access key and secret
+objex server --data ./data --listen 0.0.0.0:9000
 ```
 
 Use it with the AWS CLI:
@@ -43,9 +79,61 @@ aws --endpoint-url http://localhost:9000 s3 cp ./cat.jpg s3://photos/
 aws --endpoint-url http://localhost:9000 s3 ls s3://photos/
 ```
 
+Or from code. Any S3 SDK works when you point it at the endpoint:
+
+```js
+// JavaScript (AWS SDK v3)
+const s3 = new S3Client({ endpoint: "http://localhost:9000", region: "auto", forcePathStyle: true,
+                          credentials: { accessKeyId: "...", secretAccessKey: "..." } });
+```
+
+```python
+# Python (boto3)
+s3 = boto3.client("s3", endpoint_url="http://localhost:9000", region_name="auto",
+                  config=Config(s3={"addressing_style": "path"}))
+```
+
+## Docker Compose
+
+[`examples/docker-compose`](examples/docker-compose) runs objex next to an application, creates buckets on startup, and includes an end-to-end check written with boto3:
+
+```sh
+cd examples/docker-compose
+cp .env.example .env          # set real keys
+docker compose up -d
+docker compose --profile test run --rm smoke-test
+```
+
+The core of it:
+
+```yaml
+services:
+  objex:
+    image: ghcr.io/kajdesk/objex:latest
+    environment:
+      OBJEX_ACCESS_KEY: ${OBJEX_ACCESS_KEY}
+      OBJEX_SECRET_KEY: ${OBJEX_SECRET_KEY}
+    volumes: [objex-data:/data, objex-config:/config]
+    stop_grace_period: 30s        # lets in-flight uploads finish
+  app:
+    environment:
+      S3_ENDPOINT: http://objex:9000
+    depends_on:
+      objex: { condition: service_healthy }
+volumes: { objex-data: {}, objex-config: {} }
+```
+
+Things to know:
+
+- **Use path-style addressing.** Inside a compose network the host is `objex`, and `bucket.objex` does not resolve. Set `forcePathStyle: true` (JavaScript) or `addressing_style: "path"` (boto3).
+- **Sign browser URLs for the public address.** A presigned URL made with `http://objex:9000` only works inside the network. Create a second S3 client with the address browsers use (for example `https://s3.example.com`) to generate URLs you hand out.
+- **More than one key.** The `OBJEX_ACCESS_KEY`/`OBJEX_SECRET_KEY` variables define one key. For more, keep a volume on `/config` and run `docker compose exec objex objex key add <name> [--bucket b] [--read-only]`; the server picks it up within seconds.
+- **One container per data volume.** A second objex on the same volume refuses to start. Scale by giving each instance its own volume.
+- **Docker Desktop (macOS/Windows):** use a named volume, not a bind mount. Bind mounts make durable writes very slow.
+
 ## Configuration
 
-Settings are read from `objex.toml`. Any setting can be overridden with an `OBJEX_*` environment variable, which is convenient for Docker.
+Settings are read from `objex.toml` (or the file named by `--config` / `OBJEX_CONFIG`). Any setting can be overridden with an environment variable, which is convenient for Docker: `OBJEX_LISTEN`, `OBJEX_DATA_DIR`, `OBJEX_REGION`, `OBJEX_DOMAIN`, `OBJEX_FSYNC`, `OBJEX_SCRUB_INTERVAL_HOURS`, `OBJEX_MAX_CONNECTIONS`, and `OBJEX_ACCESS_KEY` + `OBJEX_SECRET_KEY` for a key. The config file is optional when these are set.
 
 ```toml
 listen = "0.0.0.0:9000"
@@ -84,6 +172,8 @@ objex speaks plain HTTP. Put a TLS-terminating reverse proxy (Caddy, nginx, a lo
 Built-in limits: request headers must arrive within 30 seconds (which also closes idle keep-alive connections), a request body that stalls for 60 seconds is abandoned, and at most `max_connections` connections are served at once. There are no per-key quotas or rate limits yet.
 
 Only one objex process may use a data directory; a second one refuses to start.
+
+`GET /_objex/health` returns `200 ok` without authentication, for load balancers and orchestrators. `objex health` probes it from inside a container.
 
 ## Durability
 

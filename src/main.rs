@@ -44,6 +44,13 @@ enum Command {
         #[arg(long)]
         data: Option<PathBuf>,
     },
+    /// Check that a local server is up (for container healthchecks). Exits
+    /// non-zero if it does not answer.
+    Health {
+        /// host:port to check; defaults to the configured listen port on localhost
+        #[arg(long)]
+        addr: Option<String>,
+    },
     /// Manage access keys
     Key {
         #[command(subcommand)]
@@ -107,7 +114,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
             let report = rt.block_on(async {
                 let engine = objex::storage::local::LocalEngine::open(&cfg.data_dir, false).map_err(|e| format!("opening {}: {}", cfg.data_dir.display(), e.message))?;
-                engine.scrub().await.map_err(|e| e.to_string())
+                engine.scrub(None).await.map_err(|e| e.to_string())
             })?;
             println!("checked {} blob(s), {} bytes", report.blobs, report.bytes);
             if report.unverified > 0 {
@@ -117,6 +124,17 @@ fn run(cli: Cli) -> Result<(), String> {
                 println!("DAMAGED {p}");
             }
             if report.problems.is_empty() { Ok(()) } else { Err(format!("{} damaged blob(s)", report.problems.len())) }
+        }
+        Command::Health { addr } => {
+            let addr = match addr {
+                Some(a) => a,
+                None => {
+                    let listen = Config::load(&cli.config)?.listen;
+                    let port = listen.rsplit(':').next().unwrap_or("9000").to_string();
+                    format!("127.0.0.1:{port}")
+                }
+            };
+            health(&addr)
         }
         Command::Key { command } => match command {
             KeyCommand::Add { name, buckets, read_only } => {
@@ -145,6 +163,27 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
             },
         },
+    }
+}
+
+/// Minimal HTTP/1.1 probe of the health endpoint, with no runtime or client library.
+fn health(addr: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    let timeout = Duration::from_secs(3);
+    let sock = addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or(format!("{addr}: no address"))?;
+    let mut s = std::net::TcpStream::connect_timeout(&sock, timeout).map_err(|e| format!("{addr}: {e}"))?;
+    s.set_read_timeout(Some(timeout)).and_then(|_| s.set_write_timeout(Some(timeout))).map_err(|e| e.to_string())?;
+    write!(s, "GET {} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n", objex::s3::HEALTH_PATH).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).map_err(|e| format!("{addr}: {e}"))?;
+    let status = String::from_utf8_lossy(&buf[..n]);
+    if status.starts_with("HTTP/1.1 200") {
+        println!("ok");
+        Ok(())
+    } else {
+        Err(format!("{addr}: unhealthy: {}", status.lines().next().unwrap_or("")))
     }
 }
 

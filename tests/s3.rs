@@ -406,6 +406,11 @@ async fn access_control() {
     c.put_object().bucket("private-b").key("secret.txt").body(ByteStream::from_static(b"s3cr3t")).send().await.unwrap();
     let http = reqwest::Client::new();
 
+    // the health endpoint needs no credentials
+    let r = http.get(format!("{}/_objex/health", s.endpoint)).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.text().await.unwrap(), "ok\n");
+
     // anonymous access is denied
     let r = http.get(format!("{}/private-b/secret.txt", s.endpoint)).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 403);

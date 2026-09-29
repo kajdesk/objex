@@ -14,13 +14,16 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::s3::{self, AppState};
-use crate::storage::local::LocalEngine;
+use crate::storage::local::{EngineOptions, LocalEngine};
 
 /// How long to wait for in-flight requests on shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Unreferenced blobs younger than this are left alone by GC.
 const GC_GRACE: Duration = Duration::from_secs(3600);
-const GC_INTERVAL: Duration = Duration::from_secs(3600);
+/// GC is a repair job (normal deletes are reclaimed as they happen).
+const GC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// An interrupted scrub resumes this long after startup.
+const SCRUB_RESUME_DELAY: Duration = Duration::from_secs(600);
 const KEY_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
 /// Time allowed to send request headers; also how long an idle keep-alive
 /// connection stays open.
@@ -70,6 +73,9 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>, limits: Limits, 
                         let started = Instant::now();
                         let (method, path) = (req.method().clone(), req.uri().path().to_string());
                         let resp = s3::handle(state, req).await;
+                        if path == s3::HEALTH_PATH {
+                            return Ok::<_, Infallible>(resp);
+                        }
                         tracing::info!(target: "objex::access", %peer, %method, path, status = resp.status().as_u16(), ms = started.elapsed().as_millis() as u64);
                         Ok::<_, Infallible>(resp)
                     }
@@ -138,15 +144,19 @@ fn spawn_key_reload(state: Arc<AppState>, path: PathBuf) {
     });
 }
 
-fn spawn_scrub(engine: Arc<LocalEngine>, hours: u64) {
+fn spawn_scrub(engine: Arc<LocalEngine>, hours: u64, mb_per_sec: u64) {
     if hours == 0 {
         return;
     }
+    let rate = (mb_per_sec > 0).then(|| mb_per_sec << 20);
     tokio::spawn(async move {
+        let mut first = true;
         loop {
-            tokio::time::sleep(Duration::from_secs(hours * 3600)).await;
+            let resume = first && engine.scrub_in_progress().await.unwrap_or(false);
+            first = false;
+            tokio::time::sleep(if resume { SCRUB_RESUME_DELAY } else { Duration::from_secs(hours * 3600) }).await;
             let started = Instant::now();
-            match engine.scrub().await {
+            match engine.scrub(rate).await {
                 Ok(r) if r.problems.is_empty() => {
                     tracing::info!("scrub: {} blob(s), {} bytes verified in {:.0?}", r.blobs, r.bytes, started.elapsed())
                 }
@@ -172,14 +182,20 @@ fn spawn_gc(engine: Arc<LocalEngine>) {
 
 /// Run the server described by `cfg` until a shutdown signal.
 pub async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
-    let engine = Arc::new(LocalEngine::open(&cfg.data_dir, cfg.fsync).map_err(|e| format!("opening {}: {}", cfg.data_dir.display(), e.message))?);
+    let opts = EngineOptions {
+        fsync: cfg.fsync,
+        commit_window: Duration::from_micros(cfg.commit_window_us),
+        read_buffer: cfg.read_buffer_mb.max(1) << 20,
+        ..Default::default()
+    };
+    let engine = Arc::new(LocalEngine::open_with(&cfg.data_dir, opts).map_err(|e| format!("opening {}: {}", cfg.data_dir.display(), e.message))?);
     if cfg.keys.is_empty() {
         tracing::warn!("no access keys configured: only anonymous reads of public buckets will work. Create one with `objex key add <name>`");
     }
     let state = Arc::new(AppState::new(engine.clone(), cfg.keys.clone(), cfg.region.clone(), cfg.domain.clone()));
     spawn_key_reload(state.clone(), config_path);
-    spawn_scrub(engine.clone(), cfg.scrub_interval_hours);
-    spawn_gc(engine);
+    spawn_scrub(engine.clone(), cfg.scrub_interval_hours, cfg.scrub_mb_per_sec);
+    spawn_gc(engine.clone());
     let listener = TcpListener::bind(&cfg.listen).await.map_err(|e| format!("binding {}: {e}", cfg.listen))?;
     tracing::info!(
         "objex listening on {} (data: {}, fsync: {}{})",
@@ -189,5 +205,6 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
         if cfg.domain.is_empty() { String::new() } else { format!(", virtual hosts: *.{}", cfg.domain) }
     );
     serve(listener, state, Limits { max_connections: cfg.max_connections }, shutdown_signal()).await;
+    engine.flush_reclaim().await;
     Ok(())
 }
