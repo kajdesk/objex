@@ -31,6 +31,10 @@ use crate::xml::XmlWriter;
 pub type RespBody = BoxBody<Bytes, io::Error>;
 pub type Resp = Response<RespBody>;
 
+/// Unauthenticated liveness endpoint. The underscore makes it an invalid bucket
+/// name, so it can never shadow a real bucket.
+pub const HEALTH_PATH: &str = "/_objex/health";
+
 /// Largest XML request body accepted (DeleteObjects with 1000 long keys fits).
 const MAX_XML_BODY: usize = 4 * 1024 * 1024;
 
@@ -520,6 +524,12 @@ where
     B::Error: std::fmt::Display,
 {
     let request_id = random_hex(8).to_uppercase();
+    if req.uri().path() == HEALTH_PATH && matches!(*req.method(), Method::GET | Method::HEAD) {
+        let mut r = Response::new(if req.method() == Method::HEAD { empty_body() } else { full("ok\n") });
+        r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain"));
+        r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
+        return r;
+    }
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let resource = parts.uri.path().to_string();

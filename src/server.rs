@@ -70,6 +70,9 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>, limits: Limits, 
                         let started = Instant::now();
                         let (method, path) = (req.method().clone(), req.uri().path().to_string());
                         let resp = s3::handle(state, req).await;
+                        if path == s3::HEALTH_PATH {
+                            return Ok::<_, Infallible>(resp);
+                        }
                         tracing::info!(target: "objex::access", %peer, %method, path, status = resp.status().as_u16(), ms = started.elapsed().as_millis() as u64);
                         Ok::<_, Infallible>(resp)
                     }
