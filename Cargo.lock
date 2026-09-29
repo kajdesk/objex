@@ -1585,6 +1585,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.11.1",
  "hyper-util",
+ "libc",
  "md-5",
  "percent-encoding",
  "quick-xml",

@@ -21,10 +21,37 @@ use crate::util::{random_hex, valid_bucket_name};
 // Blob files
 // ---------------------------------------------------------------------------
 
+/// Flush a file or directory to the storage device.
+///
+/// On Apple platforms this is a plain `fsync()` rather than `F_FULLFSYNC` (which is
+/// what `File::sync_all` issues there, and which flushes the whole drive cache and
+/// serializes across the machine). Durability comes from the metadata commit that
+/// always follows: redb syncs with `F_FULLFSYNC`, which also flushes everything
+/// written to the drive before it.
+fn sync_path_or_file(f: &std::fs::File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fsync on a valid, open descriptor owned by `f`.
+        if unsafe { libc::fsync(f.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    f.sync_all()
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    sync_path_or_file(&std::fs::File::open(dir)?)
+}
+
 /// Blobs stored as files under `<root>/blobs/ab/cd/<id>`, written via `<root>/tmp`.
 pub struct FileBlobStore {
     root: PathBuf,
     fsync: bool,
+    /// Shard directories whose entry in their parent is known to be durable.
+    durable_dirs: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl FileBlobStore {
@@ -36,7 +63,10 @@ impl FileBlobStore {
             std::fs::remove_dir_all(&tmp)?;
         }
         std::fs::create_dir_all(&tmp)?;
-        Ok(FileBlobStore { root: root.to_path_buf(), fsync })
+        if fsync {
+            sync_dir(root)?;
+        }
+        Ok(FileBlobStore { root: root.to_path_buf(), fsync, durable_dirs: Default::default() })
     }
 
     fn path(&self, id: &str) -> PathBuf {
@@ -47,21 +77,46 @@ impl FileBlobStore {
         self.root.join("blobs")
     }
 
+    /// Move (or link) `from` into place as blob `id`. With fsync, every shard
+    /// directory on the path, and the new entry itself, is durable on return.
     async fn place(&self, from: &Path, id: &str, link: bool) -> io::Result<()> {
-        let dst = self.path(id);
-        let dir = dst.parent().unwrap().to_path_buf();
-        tokio::fs::create_dir_all(&dir).await?;
-        if link {
-            if tokio::fs::hard_link(from, &dst).await.is_err() {
-                tokio::fs::copy(from, &dst).await?;
+        let (from, dst, blobs) = (from.to_path_buf(), self.path(id), self.blobs_dir());
+        let (fsync, durable) = (self.fsync, self.durable_dirs.clone());
+        tokio::task::spawn_blocking(move || {
+            let leaf = dst.parent().unwrap().to_path_buf();
+            let mid = leaf.parent().unwrap().to_path_buf();
+            for (dir, parent) in [(&mid, &blobs), (&leaf, &mid)] {
+                if durable.lock().unwrap().contains(dir) {
+                    continue;
+                }
+                match std::fs::create_dir(dir) {
+                    Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                    _ => {}
+                }
+                // Sync the parent even when another writer created the directory:
+                // it may not have finished syncing it yet.
+                if fsync {
+                    sync_dir(parent)?;
+                }
+                durable.lock().unwrap().insert(dir.clone());
             }
-        } else {
-            tokio::fs::rename(from, &dst).await?;
-        }
-        if self.fsync {
-            tokio::task::spawn_blocking(move || std::fs::File::open(dir)?.sync_all()).await??;
-        }
-        Ok(())
+            if link {
+                if std::fs::hard_link(&from, &dst).is_err() {
+                    let copied = std::fs::copy(&from, &dst);
+                    if fsync && copied.is_ok() {
+                        sync_path_or_file(&std::fs::File::open(&dst)?)?;
+                    }
+                    copied?;
+                }
+            } else {
+                std::fs::rename(&from, &dst)?;
+            }
+            if fsync {
+                sync_dir(&leaf)?;
+            }
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -80,13 +135,14 @@ impl BlobStore for FileBlobStore {
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
+            let digest = hasher.finish(src.trailing_checksum())?;
             if self.fsync {
-                file.sync_all().await?;
+                let f = file.into_std().await;
+                tokio::task::spawn_blocking(move || sync_path_or_file(&f)).await??;
             }
-            hasher.finish(src.trailing_checksum())
+            Ok(digest)
         }
         .await;
-        drop(file);
         let placed = match written {
             Ok(digest) => self.place(&tmp, &id, false).await.map(|_| digest).map_err(S3Error::from),
             Err(e) => Err(e),
@@ -249,7 +305,60 @@ fn validate_key(key: &str) -> S3Result<()> {
 pub struct LocalEngine<B: BlobStore = FileBlobStore> {
     db: Arc<Database>,
     blobs: Arc<B>,
-    fsync: bool,
+    committer: std::sync::mpsc::Sender<Job>,
+}
+
+/// A metadata write, run inside a shared transaction. It returns whether it failed
+/// with an internal error (the transaction may be dirty and must be aborted), and a
+/// callback that receives the commit outcome.
+type Job = Box<dyn FnOnce(&WriteTransaction) -> (bool, Done) + Send>;
+type Done = Box<dyn FnOnce(S3Result<()>) + Send>;
+
+/// Most writes folded into one transaction.
+const MAX_BATCH: usize = 256;
+
+/// Group commit: concurrent metadata writes share one redb transaction and so one
+/// fsync. redb allows a single writer, so committing each write separately would
+/// serialize every upload behind a disk flush.
+///
+/// Jobs must return client errors (precondition failed, missing upload...) before
+/// modifying any table, so a failed request never leaves partial changes in a batch.
+fn run_committer(db: Arc<Database>, fsync: bool, jobs: std::sync::mpsc::Receiver<Job>) {
+    while let Ok(first) = jobs.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH
+            && let Ok(j) = jobs.try_recv()
+        {
+            batch.push(j);
+        }
+        let mut txn = match db.begin_write() {
+            Ok(t) => t,
+            Err(e) => {
+                // Dropping the jobs unblocks their waiters with an internal error.
+                tracing::error!("begin_write: {e}");
+                continue;
+            }
+        };
+        if !fsync && let Err(e) = txn.set_durability(Durability::None) {
+            tracing::error!("set_durability: {e}");
+        }
+        let mut done = Vec::with_capacity(batch.len());
+        let mut dirty = false;
+        for job in batch {
+            let (failed, d) = job(&txn);
+            dirty |= failed;
+            done.push(d);
+        }
+        let outcome = if dirty {
+            let _ = txn.abort();
+            Err(S3Error::internal("metadata batch aborted after an internal error"))
+        } else {
+            txn.commit().map_err(S3Error::internal)
+        };
+        for d in done {
+            d(outcome.clone());
+        }
+    }
 }
 
 impl LocalEngine<FileBlobStore> {
@@ -327,14 +436,17 @@ fn changed(md: &std::fs::Metadata) -> SystemTime {
 
 impl<B: BlobStore> LocalEngine<B> {
     pub fn with_blobs(meta_path: &Path, blobs: B, fsync: bool) -> S3Result<Self> {
-        let db = Database::create(meta_path)?;
+        let db = Arc::new(Database::create(meta_path)?);
         let txn = db.begin_write()?;
         txn.open_table(BUCKETS)?;
         txn.open_table(OBJECTS)?;
         txn.open_table(UPLOADS)?;
         txn.open_table(PARTS)?;
         txn.commit()?;
-        Ok(LocalEngine { db: Arc::new(db), blobs: Arc::new(blobs), fsync })
+        let (committer, jobs) = std::sync::mpsc::channel();
+        let cdb = db.clone();
+        std::thread::Builder::new().name("objex-commit".into()).spawn(move || run_committer(cdb, fsync, jobs))?;
+        Ok(LocalEngine { db, blobs: Arc::new(blobs), committer })
     }
 
     async fn blocking<T: Send + 'static>(&self, f: impl FnOnce(&Database) -> S3Result<T> + Send + 'static) -> S3Result<T> {
@@ -343,18 +455,24 @@ impl<B: BlobStore> LocalEngine<B> {
     }
 
     /// Run `f` in a write transaction and commit it.
+    /// Run `f` in a write transaction (shared with concurrent writes) and wait until
+    /// it is committed.
     async fn write<T: Send + 'static>(&self, f: impl FnOnce(&WriteTransaction) -> S3Result<T> + Send + 'static) -> S3Result<T> {
-        let fsync = self.fsync;
-        self.blocking(move |db| {
-            let mut txn = db.begin_write()?;
-            if !fsync {
-                txn.set_durability(Durability::None)?;
-            }
-            let out = f(&txn)?;
-            txn.commit()?;
-            Ok(out)
-        })
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel::<S3Result<T>>();
+        let job: Job = Box::new(move |txn| {
+            let out = f(txn);
+            let failed = matches!(&out, Err(e) if e.code == ErrorCode::InternalError);
+            let done: Done = Box::new(move |commit| {
+                let _ = tx.send(match (out, commit) {
+                    (Err(e), _) => Err(e),
+                    (Ok(_), Err(e)) => Err(e),
+                    (Ok(v), Ok(())) => Ok(v),
+                });
+            });
+            (failed, done)
+        });
+        self.committer.send(job).map_err(|_| S3Error::internal("metadata committer stopped"))?;
+        rx.await.map_err(|_| S3Error::internal("metadata write dropped"))?
     }
 
     /// Best-effort deletion of blobs that metadata no longer references. Failures are
