@@ -141,7 +141,8 @@ pub async fn get<B>(ctx: Ctx<B>, head: bool) -> S3Result<Resp> {
             let start: u64 = info.parts[..idx].iter().sum();
             (start, info.parts[idx], true)
         }
-        (None, Some(r)) if size > 0 => match r.resolve(size) {
+        // No range is satisfiable on an empty object; resolve() reports that.
+        (None, Some(r)) => match r.resolve(size) {
             Ok((s, l)) => (s, l, true),
             Err(e) => {
                 let mut resp = super::error_response(&e, ctx.parts.uri.path(), "", head);

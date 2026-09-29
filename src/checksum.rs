@@ -184,6 +184,24 @@ impl Checksum {
     }
 }
 
+/// Whether a client-supplied value is well formed for its algorithm: base64 of a
+/// digest of the right length, optionally followed by a "-N" part count.
+pub fn valid_value(c: &Checksum) -> bool {
+    let (digest, suffix) = match c.value.split_once('-') {
+        Some((d, n)) => (d, Some(n)),
+        None => (c.value.as_str(), None),
+    };
+    let len = match c.algo {
+        ChecksumAlgo::Crc32 | ChecksumAlgo::Crc32c => 4,
+        ChecksumAlgo::Crc64nvme => 8,
+        ChecksumAlgo::Sha1 => 20,
+        ChecksumAlgo::Sha256 => 32,
+    };
+    let digest_ok = B64.decode(digest).is_ok_and(|d| d.len() == len);
+    let suffix_ok = suffix.is_none_or(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0'));
+    digest_ok && suffix_ok
+}
+
 /// Checksum of the concatenated raw digests of the parts, suffixed with "-N".
 pub fn composite(algo: ChecksumAlgo, parts: &[Checksum]) -> Option<Checksum> {
     let mut h = ChecksumHasher::new(algo);

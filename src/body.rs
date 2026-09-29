@@ -13,6 +13,8 @@ use crate::error::{ErrorCode, S3Error, S3Result};
 use crate::storage::ByteSource;
 
 const MAX_LINE: usize = 4096;
+/// A request body that sends nothing for this long is abandoned.
+const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Read the next data frame of a body, skipping HTTP trailer frames.
 async fn next_data<B>(body: &mut B) -> S3Result<Option<Bytes>>
@@ -21,7 +23,10 @@ where
     B::Error: std::fmt::Display,
 {
     loop {
-        match body.frame().await {
+        let frame = tokio::time::timeout(BODY_IDLE_TIMEOUT, body.frame())
+            .await
+            .map_err(|_| S3Error::msg(ErrorCode::IncompleteBody, "Timed out waiting for the request body"))?;
+        match frame {
             None => return Ok(None),
             Some(Err(e)) => return Err(S3Error::msg(ErrorCode::IncompleteBody, format!("reading request body: {e}"))),
             Some(Ok(f)) => {

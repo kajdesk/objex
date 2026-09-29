@@ -107,6 +107,8 @@ impl<T: Read + Seek + Send> BlobRead for T {}
 /// and verification of client-supplied digests.
 pub struct PutHasher {
     md5: md5::Md5,
+    /// Internal integrity checksum, stored with every blob.
+    crc32c: u32,
     sha256: Option<(sha2::Sha256, [u8; 32])>,
     content_md5: Option<[u8; 16]>,
     checksum: Option<crate::checksum::ChecksumHasher>,
@@ -117,6 +119,7 @@ pub struct PutHasher {
 
 pub struct PutDigest {
     pub md5: [u8; 16],
+    pub crc32c: u32,
     pub size: u64,
     pub checksum: Option<Checksum>,
 }
@@ -127,6 +130,7 @@ impl PutHasher {
         let algo = expect.checksum.as_ref().map(|c| c.algo).or(expect.checksum_algo);
         PutHasher {
             md5: md5::Md5::new(),
+            crc32c: 0,
             sha256: expect.sha256.map(|h| (sha2::Sha256::new(), h)),
             content_md5: expect.content_md5,
             checksum: algo.map(crate::checksum::ChecksumHasher::new),
@@ -139,6 +143,7 @@ impl PutHasher {
     pub fn update(&mut self, data: &[u8]) {
         use sha2::Digest;
         self.md5.update(data);
+        self.crc32c = crc32c::crc32c_append(self.crc32c, data);
         if let Some((h, _)) = &mut self.sha256 {
             h.update(data);
         }
@@ -186,7 +191,7 @@ impl PutHasher {
             }
             checksum = Some(got);
         }
-        Ok(PutDigest { md5, size: self.size, checksum })
+        Ok(PutDigest { md5, crc32c: self.crc32c, size: self.size, checksum })
     }
 }
 
@@ -209,18 +214,35 @@ pub trait BlobStore: Send + Sync + 'static {
 
 const READ_CHUNK: usize = 256 * 1024;
 
+/// One opened blob of an object.
+pub struct ReadSegment {
+    pub blob: Box<dyn BlobRead>,
+    pub size: u64,
+    /// Expected CRC32C of the whole blob, when recorded.
+    pub crc32c: Option<u32>,
+    /// Blob id, for integrity error reports.
+    pub id: String,
+}
+
 /// Opened object data, ready to stream. Holding it keeps the data readable even
 /// if the object is overwritten or deleted meanwhile.
 pub struct ObjectReader {
-    segments: Vec<(Box<dyn BlobRead>, u64)>,
+    segments: Vec<ReadSegment>,
+}
+
+pub fn integrity_error(id: &str, what: &str) -> io::Error {
+    tracing::error!("integrity: blob {id}: {what}");
+    io::Error::other(format!("integrity error in blob {id}: {what}"))
 }
 
 impl ObjectReader {
-    pub fn new(segments: Vec<(Box<dyn BlobRead>, u64)>) -> Self {
+    pub fn new(segments: Vec<ReadSegment>) -> Self {
         ObjectReader { segments }
     }
 
     /// Stream `len` bytes starting at `start` into a channel from a blocking thread.
+    /// Segments read in full are verified against their CRC32C; the last chunk of a
+    /// segment is only sent once it verifies, so corrupt data never arrives complete.
     pub fn stream(self, start: u64, len: u64) -> mpsc::Receiver<io::Result<Bytes>> {
         let (tx, rx) = mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
@@ -232,26 +254,47 @@ impl ObjectReader {
     }
 
     fn pump(self, mut start: u64, mut remaining: u64, tx: &mpsc::Sender<io::Result<Bytes>>) -> io::Result<()> {
-        for (mut blob, size) in self.segments {
+        for mut seg in self.segments {
             if remaining == 0 {
                 break;
             }
-            if start >= size {
-                start -= size;
+            if start >= seg.size {
+                start -= seg.size;
                 continue;
             }
-            blob.seek(SeekFrom::Start(start))?;
-            let mut left = (size - start).min(remaining);
+            seg.blob.seek(SeekFrom::Start(start))?;
+            let mut left = (seg.size - start).min(remaining);
+            let verify = seg.crc32c.filter(|_| start == 0 && left == seg.size);
             start = 0;
+            let mut crc = 0u32;
+            let mut held: Option<Bytes> = None;
             while left > 0 {
                 let n = (left as usize).min(READ_CHUNK);
                 let mut buf = BytesMut::zeroed(n);
-                blob.read_exact(&mut buf)?;
+                seg.blob.read_exact(&mut buf).map_err(|e| {
+                    if e.kind() == io::ErrorKind::UnexpectedEof { integrity_error(&seg.id, "blob is truncated") } else { e }
+                })?;
                 left -= n as u64;
                 remaining -= n as u64;
-                if tx.blocking_send(Ok(buf.freeze())).is_err() {
+                if verify.is_some() {
+                    crc = crc32c::crc32c_append(crc, &buf);
+                }
+                if let Some(prev) = held.take()
+                    && tx.blocking_send(Ok(prev)).is_err()
+                {
                     return Ok(()); // client went away
                 }
+                held = Some(buf.freeze());
+            }
+            if let Some(want) = verify
+                && crc != want
+            {
+                return Err(integrity_error(&seg.id, "checksum mismatch"));
+            }
+            if let Some(last) = held
+                && tx.blocking_send(Ok(last)).is_err()
+            {
+                return Ok(());
             }
         }
         Ok(())

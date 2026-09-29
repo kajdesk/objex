@@ -55,7 +55,7 @@ async fn start() -> Server {
     let state = Arc::new(AppState::new(engine, keys, "us-east-1".into(), String::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(objex::server::serve(listener, state, std::future::pending()));
+    tokio::spawn(objex::server::serve(listener, state, Default::default(), std::future::pending()));
     Server { client: client_for(&endpoint, AK, SK), endpoint, _dir: TempDir(dir) }
 }
 
@@ -186,6 +186,19 @@ async fn objects() {
     c.put_object().bucket("objs").key("empty").body(ByteStream::from_static(b"")).send().await.unwrap();
     let got = c.get_object().bucket("objs").key("empty").send().await.unwrap();
     assert_eq!(body(got).await, b"");
+    // Ranges on an empty object are unsatisfiable (OBJ-007).
+    let err = c.get_object().bucket("objs").key("empty").range("bytes=0-").send().await.unwrap_err();
+    assert_eq!(code(err.as_service_error().unwrap()), "InvalidRange");
+    let r = reqwest::Client::new()
+        .get(c.get_object().bucket("objs").key("empty").presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap()).await.unwrap().uri())
+        .header("range", "bytes=0-0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 416);
+    assert_eq!(r.headers()["content-range"], "bytes */0");
+    let err = c.head_object().bucket("objs").key("empty").range("bytes=0-").send().await.unwrap_err();
+    assert_eq!(err.raw_response().unwrap().status().as_u16(), 416);
 
     c.delete_object().bucket("objs").key("dir/hello world+ü.txt").send().await.unwrap();
     let err = c.get_object().bucket("objs").key("dir/hello world+ü.txt").send().await.unwrap_err();

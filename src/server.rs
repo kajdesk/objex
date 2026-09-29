@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
@@ -22,13 +22,36 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const GC_GRACE: Duration = Duration::from_secs(3600);
 const GC_INTERVAL: Duration = Duration::from_secs(3600);
 const KEY_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+/// Time allowed to send request headers; also how long an idle keep-alive
+/// connection stays open.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connection-level limits.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { max_connections: 4096 }
+    }
+}
 
 /// Serve S3 requests on `listener` until `shutdown` resolves, then drain connections.
-pub async fn serve(listener: TcpListener, state: Arc<AppState>, shutdown: impl Future<Output = ()>) {
-    let builder = auto::Builder::new(TokioExecutor::new());
+pub async fn serve(listener: TcpListener, state: Arc<AppState>, limits: Limits, shutdown: impl Future<Output = ()>) {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT);
+    builder.http2().timer(TokioTimer::new()).keep_alive_interval(HEADER_TIMEOUT).keep_alive_timeout(Duration::from_secs(20));
     let graceful = GracefulShutdown::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
     tokio::pin!(shutdown);
     loop {
+        // At the connection limit, stop accepting until a connection closes.
+        let permit = tokio::select! {
+            p = slots.clone().acquire_owned() => p.expect("semaphore is never closed"),
+            _ = &mut shutdown => break,
+        };
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
@@ -53,6 +76,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>, shutdown: impl F
                 });
                 let conn = graceful.watch(builder.serve_connection(TokioIo::new(stream), svc).into_owned());
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = conn.await {
                         tracing::debug!("connection from {peer}: {e}");
                     }
@@ -114,6 +138,25 @@ fn spawn_key_reload(state: Arc<AppState>, path: PathBuf) {
     });
 }
 
+fn spawn_scrub(engine: Arc<LocalEngine>, hours: u64) {
+    if hours == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(hours * 3600)).await;
+            let started = Instant::now();
+            match engine.scrub().await {
+                Ok(r) if r.problems.is_empty() => {
+                    tracing::info!("scrub: {} blob(s), {} bytes verified in {:.0?}", r.blobs, r.bytes, started.elapsed())
+                }
+                Ok(r) => tracing::error!("scrub: {} of {} blob(s) are damaged (see errors above)", r.problems.len(), r.blobs),
+                Err(e) => tracing::warn!("scrub: {e}"),
+            }
+        }
+    });
+}
+
 fn spawn_gc(engine: Arc<LocalEngine>) {
     tokio::spawn(async move {
         loop {
@@ -129,12 +172,13 @@ fn spawn_gc(engine: Arc<LocalEngine>) {
 
 /// Run the server described by `cfg` until a shutdown signal.
 pub async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
-    let engine = Arc::new(LocalEngine::open(&cfg.data_dir, cfg.fsync).map_err(|e| format!("opening {}: {e}", cfg.data_dir.display()))?);
+    let engine = Arc::new(LocalEngine::open(&cfg.data_dir, cfg.fsync).map_err(|e| format!("opening {}: {}", cfg.data_dir.display(), e.message))?);
     if cfg.keys.is_empty() {
         tracing::warn!("no access keys configured: only anonymous reads of public buckets will work. Create one with `objex key add <name>`");
     }
     let state = Arc::new(AppState::new(engine.clone(), cfg.keys.clone(), cfg.region.clone(), cfg.domain.clone()));
     spawn_key_reload(state.clone(), config_path);
+    spawn_scrub(engine.clone(), cfg.scrub_interval_hours);
     spawn_gc(engine);
     let listener = TcpListener::bind(&cfg.listen).await.map_err(|e| format!("binding {}: {e}", cfg.listen))?;
     tracing::info!(
@@ -144,6 +188,6 @@ pub async fn run(cfg: Config, config_path: PathBuf) -> Result<(), String> {
         cfg.fsync,
         if cfg.domain.is_empty() { String::new() } else { format!(", virtual hosts: *.{}", cfg.domain) }
     );
-    serve(listener, state, shutdown_signal()).await;
+    serve(listener, state, Limits { max_connections: cfg.max_connections }, shutdown_signal()).await;
     Ok(())
 }

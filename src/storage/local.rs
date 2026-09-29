@@ -191,6 +191,9 @@ const PARTS: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("parts")
 struct Segment {
     blob: BlobRef,
     size: u64,
+    /// Internal integrity checksum of the blob (absent in records from before it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    crc32c: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +247,8 @@ struct PartRecord {
     #[serde(default)]
     checksum: Option<Checksum>,
     blob: BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    crc32c: Option<u32>,
 }
 
 impl PartRecord {
@@ -306,6 +311,8 @@ pub struct LocalEngine<B: BlobStore = FileBlobStore> {
     db: Arc<Database>,
     blobs: Arc<B>,
     committer: std::sync::mpsc::Sender<Job>,
+    /// Exclusive lock on the data directory, held for the engine's lifetime.
+    _lock: Option<std::fs::File>,
 }
 
 /// A metadata write, run inside a shared transaction. It returns whether it failed
@@ -364,8 +371,13 @@ fn run_committer(db: Arc<Database>, fsync: bool, jobs: std::sync::mpsc::Receiver
 impl LocalEngine<FileBlobStore> {
     pub fn open(data_dir: &Path, fsync: bool) -> S3Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        // Take ownership of the directory before touching anything in it: startup
+        // clears tmp/, which would destroy another server's in-flight uploads.
+        let lock = lock_data_dir(data_dir)?;
         let blobs = FileBlobStore::new(data_dir, fsync)?;
-        LocalEngine::with_blobs(&data_dir.join("meta.redb"), blobs, fsync)
+        let mut engine = LocalEngine::with_blobs(&data_dir.join("meta.redb"), blobs, fsync)?;
+        engine._lock = Some(lock);
+        Ok(engine)
     }
 
     /// Delete blob files that no metadata references. Blobs changed within `grace`
@@ -404,6 +416,67 @@ impl LocalEngine<FileBlobStore> {
     }
 }
 
+/// Outcome of [`LocalEngine::scrub`].
+#[derive(Debug, Default)]
+pub struct ScrubReport {
+    /// Blobs checked.
+    pub blobs: u64,
+    pub bytes: u64,
+    /// Blobs without a recorded checksum (written before checksums were kept); only
+    /// their size was checked.
+    pub unverified: u64,
+    /// Missing, truncated or corrupt blobs, described.
+    pub problems: Vec<String>,
+}
+
+enum BlobOwner {
+    Object(String, String),
+    Part(String, u32),
+}
+
+impl BlobOwner {
+    fn describe(&self) -> String {
+        match self {
+            BlobOwner::Object(b, k) => format!("object {b}/{k}"),
+            BlobOwner::Part(u, n) => format!("upload {u} part {n}"),
+        }
+    }
+}
+
+/// Read a whole blob, checking its size and (when known) CRC32C.
+fn verify_blob(mut f: Box<dyn BlobRead>, size: u64, crc: Option<u32>) -> Result<(), String> {
+    use std::io::{Read, Seek};
+    let len = f.seek(io::SeekFrom::Start(0)).and_then(|_| f.seek(io::SeekFrom::End(0))).map_err(|e| e.to_string())?;
+    if len != size {
+        return Err(format!("size is {len}, expected {size}"));
+    }
+    let Some(want) = crc else { return Ok(()) };
+    f.seek(io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0u32;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        got = crc32c::crc32c_append(got, &buf[..n]);
+    }
+    if got != want { Err("checksum mismatch".into()) } else { Ok(()) }
+}
+
+fn lock_data_dir(data_dir: &Path) -> S3Result<std::fs::File> {
+    let path = data_dir.join("objex.lock");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(S3Error::msg(
+            ErrorCode::InternalError,
+            format!("{} is in use by another objex process", data_dir.display()),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(S3Error::internal(format!("locking {}: {e}", path.display()))),
+    }
+}
+
 fn collect_blobs(root: &Path, cutoff: SystemTime) -> io::Result<Vec<String>> {
     let mut out = Vec::new();
     for a in std::fs::read_dir(root)? {
@@ -435,6 +508,74 @@ fn changed(md: &std::fs::Metadata) -> SystemTime {
 }
 
 impl<B: BlobStore> LocalEngine<B> {
+    /// Verify every referenced blob. Problems are logged and reported; a blob that
+    /// changes owner while being checked (overwritten, deleted) is not a problem.
+    pub async fn scrub(&self) -> S3Result<ScrubReport> {
+        let refs: Vec<(BlobOwner, BlobRef, u64, Option<u32>)> = self
+            .blocking(|db| {
+                let txn = db.begin_read()?;
+                let mut refs = Vec::new();
+                for e in txn.open_table(OBJECTS)?.iter()? {
+                    let (k, v) = e?;
+                    let (b, key) = k.value();
+                    let rec: ObjectRecord = dec(v.value())?;
+                    for seg in rec.segments {
+                        refs.push((BlobOwner::Object(b.to_string(), key.to_string()), seg.blob, seg.size, seg.crc32c));
+                    }
+                }
+                for e in txn.open_table(PARTS)?.iter()? {
+                    let (k, v) = e?;
+                    let (u, n) = k.value();
+                    let rec: PartRecord = dec(v.value())?;
+                    refs.push((BlobOwner::Part(u.to_string(), n), rec.blob, rec.size, rec.crc32c));
+                }
+                Ok(refs)
+            })
+            .await?;
+        let mut report = ScrubReport::default();
+        for (owner, blob, size, crc) in refs {
+            report.blobs += 1;
+            report.bytes += size;
+            if crc.is_none() {
+                report.unverified += 1;
+            }
+            let result = match self.blobs.open(&blob).await {
+                Ok(f) => tokio::task::spawn_blocking(move || verify_blob(f, size, crc)).await?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Err("blob file is missing".into()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(problem) = result
+                && self.still_owns(&owner, &blob.id).await?
+            {
+                let msg = format!("{}: blob {}: {problem}", owner.describe(), blob.id);
+                tracing::error!("scrub: {msg}");
+                report.problems.push(msg);
+            }
+        }
+        Ok(report)
+    }
+
+    async fn still_owns(&self, owner: &BlobOwner, id: &str) -> S3Result<bool> {
+        let (owner, id) = (match owner {
+            BlobOwner::Object(b, k) => BlobOwner::Object(b.clone(), k.clone()),
+            BlobOwner::Part(u, n) => BlobOwner::Part(u.clone(), *n),
+        }, id.to_string());
+        self.blocking(move |db| {
+            let txn = db.begin_read()?;
+            Ok(match owner {
+                BlobOwner::Object(b, k) => match txn.open_table(OBJECTS)?.get((b.as_str(), k.as_str()))? {
+                    Some(v) => dec::<ObjectRecord>(v.value())?.segments.iter().any(|s| s.blob.id == id),
+                    None => false,
+                },
+                BlobOwner::Part(u, n) => match txn.open_table(PARTS)?.get((u.as_str(), n))? {
+                    Some(v) => dec::<PartRecord>(v.value())?.blob.id == id,
+                    None => false,
+                },
+            })
+        })
+        .await
+    }
+
     pub fn with_blobs(meta_path: &Path, blobs: B, fsync: bool) -> S3Result<Self> {
         let db = Arc::new(Database::create(meta_path)?);
         let txn = db.begin_write()?;
@@ -446,7 +587,7 @@ impl<B: BlobStore> LocalEngine<B> {
         let (committer, jobs) = std::sync::mpsc::channel();
         let cdb = db.clone();
         std::thread::Builder::new().name("objex-commit".into()).spawn(move || run_committer(cdb, fsync, jobs))?;
-        Ok(LocalEngine { db, blobs: Arc::new(blobs), committer })
+        Ok(LocalEngine { db, blobs: Arc::new(blobs), committer, _lock: None })
     }
 
     async fn blocking<T: Send + 'static>(&self, f: impl FnOnce(&Database) -> S3Result<T> + Send + 'static) -> S3Result<T> {
@@ -509,7 +650,12 @@ impl<B: BlobStore> LocalEngine<B> {
     async fn open_record(&self, rec: &ObjectRecord) -> io::Result<ObjectReader> {
         let mut segments = Vec::with_capacity(rec.segments.len());
         for s in &rec.segments {
-            segments.push((self.blobs.open(&s.blob).await?, s.size));
+            let mut blob = self.blobs.open(&s.blob).await?;
+            let len = blob.seek(io::SeekFrom::End(0))?;
+            if len != s.size {
+                return Err(integrity_error(&s.blob.id, &format!("size is {len}, expected {}", s.size)));
+            }
+            segments.push(ReadSegment { blob, size: s.size, crc32c: s.crc32c, id: s.blob.id.clone() });
         }
         Ok(ObjectReader::new(segments))
     }
@@ -531,7 +677,7 @@ impl<B: BlobStore> LocalEngine<B> {
     /// Commit `rec` as bucket/key, subject to `cond`, then drop the replaced object's
     /// data. On failure the caller still owns the new data. With `upload`, the
     /// multipart upload is removed in the same transaction.
-    async fn commit_object(&self, bucket: &str, key: &str, rec: ObjectRecord, cond: WriteConditions, upload: Option<String>) -> S3Result<ObjectInfo> {
+    async fn commit_object(&self, bucket: &str, key: &str, rec: ObjectRecord, cond: WriteConditions, upload: Option<(String, Vec<u32>)>) -> S3Result<ObjectInfo> {
         let info = rec.info(key);
         let (b, k) = (bucket.to_string(), key.to_string());
         let garbage = self
@@ -544,10 +690,26 @@ impl<B: BlobStore> LocalEngine<B> {
                 };
                 cond.check(old.as_ref().map(|o| o.etag.as_str()))?;
                 let mut garbage: Vec<BlobRef> = old.map(|o| o.segments.into_iter().map(|s| s.blob).collect()).unwrap_or_default();
-                if let Some(id) = upload {
-                    if txn.open_table(UPLOADS)?.remove((b.as_str(), k.as_str(), id.as_str()))?.is_none() {
+                if let Some((id, numbers)) = upload {
+                    // Validate everything before modifying anything (see run_committer).
+                    if txn.open_table(UPLOADS)?.get((b.as_str(), k.as_str(), id.as_str()))?.is_none() {
                         return Err(ErrorCode::NoSuchUpload.into());
                     }
+                    {
+                        // Each part must still be the one the object was built from: a
+                        // concurrent UploadPart may have replaced (and deleted) it.
+                        let parts = txn.open_table(PARTS)?;
+                        for (n, seg) in numbers.iter().zip(&rec.segments) {
+                            let current = match parts.get((id.as_str(), *n))? {
+                                Some(v) => Some(dec::<PartRecord>(v.value())?.blob.id),
+                                None => None,
+                            };
+                            if current.as_deref() != Some(seg.blob.id.as_str()) {
+                                return Err(S3Error::msg(ErrorCode::InvalidPart, format!("Part {n} was replaced while the upload was being completed")));
+                            }
+                        }
+                    }
+                    txn.open_table(UPLOADS)?.remove((b.as_str(), k.as_str(), id.as_str()))?;
                     // Parts the object does not use become garbage.
                     let used: HashSet<&str> = rec.blobs().map(|b| b.id.as_str()).collect();
                     let parts = remove_parts(&mut txn.open_table(PARTS)?, &id)?;
@@ -559,6 +721,83 @@ impl<B: BlobStore> LocalEngine<B> {
             .await?;
         self.discard(garbage).await;
         Ok(info)
+    }
+
+    /// Validate a CompleteMultipartUpload request and build the object record plus
+    /// the part numbers it uses. Nothing is written; `commit_object` re-checks the
+    /// parts inside its transaction.
+    async fn prepare_complete(&self, bucket: &str, key: &str, upload_id: &str, parts: Vec<CompletePart>, opts: CompleteOptions) -> S3Result<(ObjectRecord, Vec<u32>)> {
+        if parts.is_empty() {
+            return Err(S3Error::msg(ErrorCode::MalformedXML, "You must specify at least one part"));
+        }
+        if parts.windows(2).any(|w| w[0].number >= w[1].number) {
+            return Err(ErrorCode::InvalidPartOrder.into());
+        }
+        let upload = self.read_upload(bucket, key, upload_id).await?;
+        let u = upload_id.to_string();
+        let stored: Vec<Option<PartRecord>> = {
+            let numbers: Vec<u32> = parts.iter().map(|p| p.number).collect();
+            self.blocking(move |db| {
+                let txn = db.begin_read()?;
+                let t = txn.open_table(PARTS)?;
+                numbers
+                    .into_iter()
+                    .map(|n| match t.get((u.as_str(), n))? {
+                        Some(v) => Ok(Some(dec(v.value())?)),
+                        None => Ok(None),
+                    })
+                    .collect()
+            })
+            .await?
+        };
+        let count = parts.len();
+        let mut segments = Vec::with_capacity(count);
+        let mut md5s = Vec::with_capacity(count * 16);
+        let mut checksums = Vec::new();
+        for (i, (want, have)) in parts.iter().zip(stored).enumerate() {
+            let have = have.ok_or(ErrorCode::InvalidPart)?;
+            if want.etag.trim_matches('"') != have.etag {
+                return Err(ErrorCode::InvalidPart.into());
+            }
+            if let Some(c) = &want.checksum
+                && have.checksum.as_ref() != Some(c)
+            {
+                return Err(S3Error::msg(ErrorCode::InvalidPart, format!("The checksum for part {} did not match", want.number)));
+            }
+            if i + 1 < count && have.size < MIN_PART_SIZE {
+                return Err(ErrorCode::EntityTooSmall.into());
+            }
+            md5s.extend(hex::decode(&have.etag).map_err(S3Error::internal)?);
+            if let Some(c) = &have.checksum {
+                checksums.push((c.clone(), have.size));
+            }
+            segments.push(Segment { blob: have.blob, size: have.size, crc32c: have.crc32c });
+        }
+        let size: u64 = segments.iter().map(|s| s.size).sum();
+        if size > MAX_OBJECT_SIZE {
+            return Err(ErrorCode::EntityTooLarge.into());
+        }
+        let checksum = match upload.checksum_algo {
+            Some(algo) if checksums.len() == count => match upload.checksum_type.unwrap_or(algo.default_type()) {
+                ChecksumType::Composite => checksum::composite(algo, &checksums.iter().map(|c| c.0.clone()).collect::<Vec<_>>()),
+                ChecksumType::FullObject => checksum::combine_full(algo, &checksums),
+            },
+            _ => None,
+        };
+        if let Some(want) = &opts.checksum {
+            match &checksum {
+                // The whole value must match: a composite checksum carries its "-N"
+                // part count and a full-object checksum carries no suffix.
+                Some(got) if checksum::valid_value(want) && got == want => {}
+                _ => {
+                    return Err(S3Error::msg(ErrorCode::BadDigest, format!("The {} you specified did not match the calculated checksum.", want.algo.name())));
+                }
+            }
+        }
+        use md5::Digest;
+        let etag = format!("{}-{count}", hex::encode(md5::Md5::digest(&md5s)));
+        let rec = ObjectRecord { size, etag, mtime: now(), meta: upload.meta, checksum, multipart: true, segments };
+        Ok((rec, parts.iter().map(|p| p.number).collect()))
     }
 
     async fn read_upload(&self, bucket: &str, key: &str, upload_id: &str) -> S3Result<UploadRecord> {
@@ -619,7 +858,7 @@ fn single_record(blob: BlobRef, digest: PutDigest, meta: ObjectMetadata) -> Obje
         meta,
         checksum: digest.checksum,
         multipart: false,
-        segments: vec![Segment { blob, size: digest.size }],
+        segments: vec![Segment { blob, size: digest.size, crc32c: Some(digest.crc32c) }],
     }
 }
 
@@ -786,7 +1025,7 @@ impl<B: BlobStore> ObjectLayer for LocalEngine<B> {
             let mut failed = None;
             for s in &src.segments {
                 match self.blobs.duplicate(&s.blob).await {
-                    Ok(b) => dups.push(Segment { blob: b, size: s.size }),
+                    Ok(b) => dups.push(Segment { blob: b, size: s.size, crc32c: s.crc32c }),
                     Err(e) => {
                         failed = Some(e);
                         break;
@@ -916,7 +1155,7 @@ impl<B: BlobStore> ObjectLayer for LocalEngine<B> {
             }
         }
         let (blob, digest) = self.blobs.put(src, PutHasher::new(&expect), MAX_PUT_SIZE).await?;
-        let rec = PartRecord { etag: md5_hex(&digest), size: digest.size, mtime: now(), checksum: digest.checksum, blob };
+        let rec = PartRecord { etag: md5_hex(&digest), size: digest.size, mtime: now(), crc32c: Some(digest.crc32c), checksum: digest.checksum, blob };
         self.commit_part(bucket, key, upload_id, part, rec).await
     }
 
@@ -940,81 +1179,15 @@ impl<B: BlobStore> ObjectLayer for LocalEngine<B> {
         let mut source = ChannelSource(reader.stream(start, len));
         let expect = PutExpect { checksum_algo: upload.checksum_algo, size: Some(len), ..Default::default() };
         let (blob, digest) = self.blobs.put(&mut source, PutHasher::new(&expect), MAX_PUT_SIZE).await?;
-        let rec = PartRecord { etag: md5_hex(&digest), size: digest.size, mtime: now(), checksum: digest.checksum, blob };
+        let rec = PartRecord { etag: md5_hex(&digest), size: digest.size, mtime: now(), crc32c: Some(digest.crc32c), checksum: digest.checksum, blob };
         let info = self.commit_part(bucket, key, upload_id, part, rec).await?;
         Ok((info, src_info))
     }
 
     async fn complete_multipart(&self, bucket: &str, key: &str, upload_id: &str, parts: Vec<CompletePart>, opts: CompleteOptions) -> S3Result<ObjectInfo> {
-        if parts.is_empty() {
-            return Err(S3Error::msg(ErrorCode::MalformedXML, "You must specify at least one part"));
-        }
-        if parts.windows(2).any(|w| w[0].number >= w[1].number) {
-            return Err(ErrorCode::InvalidPartOrder.into());
-        }
-        let upload = self.read_upload(bucket, key, upload_id).await?;
-        let u = upload_id.to_string();
-        let stored: Vec<Option<PartRecord>> = {
-            let numbers: Vec<u32> = parts.iter().map(|p| p.number).collect();
-            self.blocking(move |db| {
-                let txn = db.begin_read()?;
-                let t = txn.open_table(PARTS)?;
-                numbers
-                    .into_iter()
-                    .map(|n| match t.get((u.as_str(), n))? {
-                        Some(v) => Ok(Some(dec(v.value())?)),
-                        None => Ok(None),
-                    })
-                    .collect()
-            })
-            .await?
-        };
-        let count = parts.len();
-        let mut segments = Vec::with_capacity(count);
-        let mut md5s = Vec::with_capacity(count * 16);
-        let mut checksums = Vec::new();
-        for (i, (want, have)) in parts.iter().zip(stored).enumerate() {
-            let have = have.ok_or(ErrorCode::InvalidPart)?;
-            if want.etag.trim_matches('"') != have.etag {
-                return Err(ErrorCode::InvalidPart.into());
-            }
-            if let Some(c) = &want.checksum
-                && have.checksum.as_ref() != Some(c)
-            {
-                return Err(S3Error::msg(ErrorCode::InvalidPart, format!("The checksum for part {} did not match", want.number)));
-            }
-            if i + 1 < count && have.size < MIN_PART_SIZE {
-                return Err(ErrorCode::EntityTooSmall.into());
-            }
-            md5s.extend(hex::decode(&have.etag).map_err(S3Error::internal)?);
-            if let Some(c) = &have.checksum {
-                checksums.push((c.clone(), have.size));
-            }
-            segments.push(Segment { blob: have.blob, size: have.size });
-        }
-        let size: u64 = segments.iter().map(|s| s.size).sum();
-        if size > MAX_OBJECT_SIZE {
-            return Err(ErrorCode::EntityTooLarge.into());
-        }
-        let checksum = match upload.checksum_algo {
-            Some(algo) if checksums.len() == count => match upload.checksum_type.unwrap_or(algo.default_type()) {
-                ChecksumType::Composite => checksum::composite(algo, &checksums.iter().map(|c| c.0.clone()).collect::<Vec<_>>()),
-                ChecksumType::FullObject => checksum::combine_full(algo, &checksums),
-            },
-            _ => None,
-        };
-        if let Some(want) = &opts.checksum {
-            match &checksum {
-                Some(got) if got.algo == want.algo && got.value.split('-').next() == want.value.split('-').next() => {}
-                _ => {
-                    return Err(S3Error::msg(ErrorCode::BadDigest, format!("The {} you specified did not match the calculated checksum.", want.algo.name())));
-                }
-            }
-        }
-        use md5::Digest;
-        let etag = format!("{}-{count}", hex::encode(md5::Md5::digest(&md5s)));
-        let rec = ObjectRecord { size, etag, mtime: now(), meta: upload.meta, checksum, multipart: true, segments };
-        self.commit_object(bucket, key, rec, opts.cond, Some(upload_id.to_string())).await
+        let cond = opts.cond.clone();
+        let (rec, numbers) = self.prepare_complete(bucket, key, upload_id, parts, opts).await?;
+        self.commit_object(bucket, key, rec, cond, Some((upload_id.to_string(), numbers))).await
     }
 
     async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> S3Result<()> {
@@ -1356,5 +1529,116 @@ mod tests {
         assert_eq!(read_all(&e, "bk1", "dst").await, b"copy me");
         e.abort_multipart("bk1", "mp", &id).await.unwrap();
         assert_eq!(blob_count(&d), 1);
+    }
+
+    /// OBJ-001: a part replaced between completion's reads and its commit must not
+    /// yield an object that references the replaced (deleted) blob.
+    #[tokio::test]
+    async fn complete_races_part_replacement() {
+        let (e, _d) = engine().await;
+        e.create_bucket("bk1", false).await.unwrap();
+        let id = e.create_multipart("bk1", "k", ObjectMetadata::default(), None).await.unwrap();
+        let upload = |data: &'static [u8]| {
+            let (e, id) = (&e, id.clone());
+            async move {
+                let mut src = BytesSource(Some(Bytes::from_static(data)));
+                e.upload_part("bk1", "k", &id, 1, &mut src, PutExpect::default()).await.unwrap()
+            }
+        };
+        let a = upload(b"version A").await;
+        let parts = vec![CompletePart { number: 1, etag: a.etag.clone(), checksum: None }];
+        let (rec, numbers) = e.prepare_complete("bk1", "k", &id, parts, CompleteOptions::default()).await.unwrap();
+
+        let b = upload(b"version B").await; // deletes blob A
+
+        let err = e.commit_object("bk1", "k", rec, WriteConditions::default(), Some((id.clone(), numbers))).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPart);
+        assert_eq!(e.head_object("bk1", "k").await.unwrap_err().code, ErrorCode::NoSuchKey);
+
+        // The upload is intact and completes with the new part.
+        let parts = vec![CompletePart { number: 1, etag: b.etag, checksum: None }];
+        e.complete_multipart("bk1", "k", &id, parts, CompleteOptions::default()).await.unwrap();
+        assert_eq!(read_all(&e, "bk1", "k").await, b"version B");
+    }
+
+    /// OBJ-006: the client's full checksum value must match exactly, suffix included.
+    #[tokio::test]
+    async fn complete_checksum_suffix_is_strict() {
+        let (e, _d) = engine().await;
+        e.create_bucket("bk1", false).await.unwrap();
+        let mut good = None;
+        for attempt in ["-2", "-x", "", "-1"] {
+            let id = e.create_multipart("bk1", "k", ObjectMetadata::default(), Some((ChecksumAlgo::Crc32, ChecksumType::Composite))).await.unwrap();
+            let mut src = BytesSource(Some(Bytes::from_static(b"data")));
+            let part = e.upload_part("bk1", "k", &id, 1, &mut src, PutExpect::default()).await.unwrap();
+            let composite = crate::checksum::composite(ChecksumAlgo::Crc32, &[part.checksum.clone().unwrap()]).unwrap();
+            let digest = composite.value.split('-').next().unwrap().to_string();
+            let opts = CompleteOptions { checksum: Some(Checksum { algo: ChecksumAlgo::Crc32, value: format!("{digest}{attempt}") }), ..Default::default() };
+            let parts = vec![CompletePart { number: 1, etag: part.etag, checksum: None }];
+            let r = e.complete_multipart("bk1", "k", &id, parts, opts).await;
+            if attempt == "-1" {
+                good = Some(r.unwrap());
+            } else {
+                assert_eq!(r.unwrap_err().code, ErrorCode::BadDigest, "suffix {attempt:?}");
+            }
+        }
+        assert!(good.unwrap().checksum.unwrap().value.ends_with("-1"));
+    }
+
+    /// OBJ-002: a second engine on the same directory fails without touching tmp/.
+    #[tokio::test]
+    async fn data_dir_is_exclusive() {
+        let (_e, d) = engine().await;
+        let inflight = d.join("tmp").join("upload-in-progress");
+        std::fs::write(&inflight, b"partial").unwrap();
+        let err = LocalEngine::open(&d, false).err().expect("second open must fail");
+        assert!(err.message.contains("in use"), "{err}");
+        assert_eq!(std::fs::read(&inflight).unwrap(), b"partial");
+    }
+
+    /// OBJ-005: corrupt and truncated blobs are caught on read and by scrub.
+    #[tokio::test]
+    async fn integrity_checks() {
+        let (e, d) = engine().await;
+        e.create_bucket("bk1", false).await.unwrap();
+        let data = big(600_000, 4);
+        let mut src = BytesSource(Some(Bytes::copy_from_slice(&data)));
+        e.put_object("bk1", "k", &mut src, PutOptions::default()).await.unwrap();
+        put(&e, "bk1", "fine", b"untouched").await;
+        assert!(e.scrub().await.unwrap().problems.is_empty());
+
+        let blobs = collect_blobs(&d.join("blobs"), SystemTime::now() + Duration::from_secs(60)).unwrap();
+        let path = blobs.iter().map(|id| e.blobs.path(id)).find(|p| std::fs::metadata(p).unwrap().len() == data.len() as u64).unwrap();
+        // Flip one byte, keeping the length.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[500_000] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (info, r) = e.get_object("bk1", "k").await.unwrap();
+        let mut rx = r.stream(0, info.size);
+        let mut received = 0;
+        let mut failed = false;
+        while let Some(c) = rx.recv().await {
+            match c {
+                Ok(b) => received += b.len(),
+                Err(_) => failed = true,
+            }
+        }
+        assert!(failed, "corruption must fail the stream");
+        assert!(received < data.len(), "corrupt data must never arrive complete");
+        // A range that doesn't cover the whole blob is served unverified.
+        let (_, r) = e.get_object("bk1", "k").await.unwrap();
+        let mut rx = r.stream(0, 10);
+        assert!(rx.recv().await.unwrap().is_ok());
+
+        let report = e.scrub().await.unwrap();
+        assert_eq!(report.blobs, 2);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert!(report.problems[0].contains("bk1/k") && report.problems[0].contains("mismatch"));
+
+        // Truncation is caught when the object is opened.
+        std::fs::write(&path, &bytes[..1000]).unwrap();
+        assert_eq!(e.get_object("bk1", "k").await.err().unwrap().code, ErrorCode::InternalError);
+        assert!(e.scrub().await.unwrap().problems[0].contains("size is 1000"));
     }
 }

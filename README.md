@@ -16,7 +16,8 @@ objex ships as a single static binary. It runs as a single node today, and its s
 - **Multipart uploads**: create, upload part, upload part copy (with ranges), complete, abort, list parts, and list uploads. Completing an upload copies no data.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA1, and SHA256 are verified on upload and returned when requested with `x-amz-checksum-mode`. These are the defaults in newer AWS SDKs.
 - **Addressing**: both path-style (`host/bucket/key`) and virtual-host style (`bucket.domain/key`).
-- **Durable by default**: data and metadata are fsynced before a write is acknowledged. Pass `--no-fsync` to trade durability for speed.
+- **Durable by default**: data and metadata are flushed to disk before a write is acknowledged (see [Durability](#durability)). Pass `--no-fsync` to trade durability for speed.
+- **Integrity checked**: every blob carries an internal CRC32C. Full reads are verified before the last bytes are sent, and a background scrub re-checks everything weekly (`objex scrub` does it offline).
 
 ## Quick start
 
@@ -52,6 +53,8 @@ data_dir = "./data"
 region = "auto"            # region reported to clients; any signed region is accepted
 domain = "s3.example.com"  # optional: enables virtual-host style bucket.s3.example.com
 fsync = true
+scrub_interval_hours = 168 # background integrity scrub; 0 disables
+max_connections = 4096
 
 [[keys]]
 name = "admin"
@@ -73,6 +76,26 @@ A running server picks up key changes within a couple of seconds; no restart is 
 Buckets are private by default. A bucket created with the `public-read` canned ACL (or switched with `PutBucketAcl`) also serves anonymous `GET`, `HEAD`, and listing requests.
 
 Logging is controlled with `OBJEX_LOG` (for example `OBJEX_LOG=debug`, or `OBJEX_LOG=info,objex::access=off` to silence the access log).
+
+## Deployment
+
+objex speaks plain HTTP. Put a TLS-terminating reverse proxy (Caddy, nginx, a load balancer) in front of it for anything beyond a trusted network, and set the proxy's body size limit high enough for your largest single PUT or part (5 GiB).
+
+Built-in limits: request headers must arrive within 30 seconds (which also closes idle keep-alive connections), a request body that stalls for 60 seconds is abandoned, and at most `max_connections` connections are served at once. There are no per-key quotas or rate limits yet.
+
+Only one objex process may use a data directory; a second one refuses to start.
+
+## Durability
+
+With `fsync = true` (the default), a write is acknowledged only after:
+
+1. the object data is written to a temporary file and flushed,
+2. any new shard directories and the renamed blob's directory entry are flushed, and
+3. the metadata transaction is committed with a full flush.
+
+On Linux each step uses `fsync`. On macOS, steps 1 and 2 use `fsync` and step 3 uses `F_FULLFSYNC`, which forces the drive's cache (and so everything written before it) to stable storage. Concurrent writes share metadata commits, so heavy parallel upload traffic costs far fewer flushes than one per object.
+
+This ordering has been reviewed but not yet power-cut tested. It relies on the filesystem honoring `fsync` on files and directories (ext4, XFS, APFS do).
 
 ## Architecture
 

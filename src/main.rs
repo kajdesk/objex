@@ -37,6 +37,13 @@ enum Command {
         #[arg(long)]
         no_fsync: bool,
     },
+    /// Verify every stored blob against its checksum. The server must be stopped;
+    /// a running server scrubs on its own every `scrub_interval_hours`.
+    Scrub {
+        /// Data directory (overrides the config file)
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
     /// Manage access keys
     Key {
         #[command(subcommand)]
@@ -91,6 +98,25 @@ fn run(cli: Cli) -> Result<(), String> {
                 .build()
                 .map_err(|e| e.to_string())?
                 .block_on(objex::server::run(cfg, cli.config))
+        }
+        Command::Scrub { data } => {
+            let mut cfg = Config::load(&cli.config)?;
+            if let Some(d) = data {
+                cfg.data_dir = d;
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+            let report = rt.block_on(async {
+                let engine = objex::storage::local::LocalEngine::open(&cfg.data_dir, false).map_err(|e| format!("opening {}: {}", cfg.data_dir.display(), e.message))?;
+                engine.scrub().await.map_err(|e| e.to_string())
+            })?;
+            println!("checked {} blob(s), {} bytes", report.blobs, report.bytes);
+            if report.unverified > 0 {
+                println!("{} blob(s) predate checksums; only their size was checked", report.unverified);
+            }
+            for p in &report.problems {
+                println!("DAMAGED {p}");
+            }
+            if report.problems.is_empty() { Ok(()) } else { Err(format!("{} damaged blob(s)", report.problems.len())) }
         }
         Command::Key { command } => match command {
             KeyCommand::Add { name, buckets, read_only } => {
