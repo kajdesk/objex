@@ -3,3 +3,8 @@ pub mod config;
 pub mod error;
 pub mod storage;
 pub mod util;
+pub mod auth;
+pub mod body;
+pub mod xml;
+pub mod s3;
+pub mod server;
