@@ -17,8 +17,15 @@ pub struct Config {
     pub fsync: bool,
     /// Hours between background integrity scrubs of all data; 0 disables them.
     pub scrub_interval_hours: u64,
+    /// Scrub read-rate limit in MiB/s; 0 = unlimited.
+    pub scrub_mb_per_sec: u64,
     /// Most client connections served at once; further connections wait.
     pub max_connections: usize,
+    /// Group commit: microseconds the first metadata write of a batch waits for
+    /// others to join it. 0 batches only writes already queued.
+    pub commit_window_us: u64,
+    /// Most object data (MiB) buffered for downloads across all requests.
+    pub read_buffer_mb: usize,
     pub keys: Vec<KeyConfig>,
 }
 
@@ -31,7 +38,10 @@ impl Default for Config {
             domain: String::new(),
             fsync: true,
             scrub_interval_hours: 168,
+            scrub_mb_per_sec: 64,
             max_connections: 4096,
+            commit_window_us: 0,
+            read_buffer_mb: 256,
             keys: Vec::new(),
         }
     }
@@ -91,6 +101,15 @@ impl Config {
         if let Some(v) = env("OBJEX_MAX_CONNECTIONS").and_then(|v| v.parse().ok()) {
             self.max_connections = v;
         }
+        if let Some(v) = env("OBJEX_SCRUB_MB_PER_SEC").and_then(|v| v.parse().ok()) {
+            self.scrub_mb_per_sec = v;
+        }
+        if let Some(v) = env("OBJEX_COMMIT_WINDOW_US").and_then(|v| v.parse().ok()) {
+            self.commit_window_us = v;
+        }
+        if let Some(v) = env("OBJEX_READ_BUFFER_MB").and_then(|v| v.parse().ok()) {
+            self.read_buffer_mb = v;
+        }
         if let (Some(ak), Some(sk)) = (env("OBJEX_ACCESS_KEY"), env("OBJEX_SECRET_KEY")) {
             self.keys.retain(|k| k.access_key != ak);
             self.keys.push(KeyConfig { name: "env".into(), access_key: ak, secret_key: sk, buckets: vec![], read_only: false });
@@ -123,8 +142,19 @@ fsync = true
 # Hours between background checks of every stored blob against its checksum (0 = off)
 scrub_interval_hours = 168
 
+# Read-rate limit for scrubbing, in MiB/s (0 = unlimited)
+scrub_mb_per_sec = 64
+
 # Most client connections served at once
 max_connections = 4096
+
+# Group commit window in microseconds: the first metadata write of a batch waits
+# this long for others to share its disk flush. 0 = only batch writes already queued.
+commit_window_us = 0
+
+# Most object data (MiB) held in memory for downloads across all requests; slow
+# clients wait for room instead of growing memory.
+read_buffer_mb = 256
 
 # Access keys are managed with `objex key add|list|rm`, and are hot-reloaded by a running server.
 # [[keys]]

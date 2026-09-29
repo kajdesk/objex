@@ -88,8 +88,8 @@ fn object_headers<B>(ctx: &Ctx<B>, info: &ObjectInfo, h: &mut HeaderMap) {
     set(h, "etag", format!("\"{}\"", info.etag));
     set(h, "last-modified", http_date(&info.last_modified));
     set(h, "accept-ranges", "bytes");
-    if !info.parts.is_empty() {
-        set(h, "x-amz-mp-parts-count", info.parts.len().to_string());
+    if info.parts_count > 0 {
+        set(h, "x-amz-mp-parts-count", info.parts_count.to_string());
     }
     set(h, "x-amz-storage-class", "STANDARD");
 }
@@ -113,7 +113,8 @@ pub async fn get<B>(ctx: Ctx<B>, head: bool) -> S3Result<Resp> {
         return Err(S3Error::msg(ErrorCode::InvalidRequest, "Cannot specify both Range header and partNumber query parameter"));
     }
 
-    let (info, reader) = if head {
+    // HEAD needs the reader only for part sizes; creating one opens no files.
+    let (info, reader) = if head && part_number.is_none() {
         (ctx.state.store.head_object(&ctx.bucket, &ctx.key).await?, None)
     } else {
         let (i, r) = ctx.state.store.get_object(&ctx.bucket, &ctx.key).await?;
@@ -127,19 +128,15 @@ pub async fn get<B>(ctx: Ctx<B>, head: bool) -> S3Result<Resp> {
     let size = info.size;
     // (start, len, whether this is a partial response)
     let (start, len, partial) = match (part_number, range) {
-        (Some(n), _) if info.parts.is_empty() => {
+        (Some(n), _) if info.parts_count == 0 => {
             if n != 1 {
                 return Err(ErrorCode::InvalidPartNumber.into());
             }
             (0, size, false)
         }
         (Some(n), _) => {
-            let idx = n as usize - 1;
-            if idx >= info.parts.len() {
-                return Err(ErrorCode::InvalidPartNumber.into());
-            }
-            let start: u64 = info.parts[..idx].iter().sum();
-            (start, info.parts[idx], true)
+            let (start, len) = reader.as_ref().and_then(|r| r.part_range(n)).ok_or(ErrorCode::InvalidPartNumber)?;
+            (start, len, true)
         }
         // No range is satisfiable on an empty object; resolve() reports that.
         (None, Some(r)) => match r.resolve(size) {
@@ -154,7 +151,7 @@ pub async fn get<B>(ctx: Ctx<B>, head: bool) -> S3Result<Resp> {
     };
 
     let body = match reader {
-        Some(r) if len > 0 => stream_body(r.stream(start, len)),
+        Some(r) if len > 0 && !head => stream_body(r.open(start, len).await.map_err(S3Error::internal)?),
         _ => empty_body(),
     };
     let mut resp = http::Response::new(body);

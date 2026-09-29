@@ -9,13 +9,15 @@
 pub mod local;
 
 use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, SeekFrom};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::checksum::{Checksum, ChecksumAlgo, ChecksumType};
 use crate::error::{ErrorCode, S3Error, S3Result};
@@ -98,10 +100,10 @@ pub struct BlobRef {
     pub layout: ErasureLayout,
 }
 
-/// A readable handle to one blob. Opened before a response starts so that
-/// concurrent overwrites/deletes cannot pull the data out from under a reader.
-pub trait BlobRead: Read + Seek + Send {}
-impl<T: Read + Seek + Send> BlobRead for T {}
+/// An open, readable blob. Reads are async so a reader waiting on a slow client
+/// holds no thread.
+pub trait BlobRead: AsyncRead + AsyncSeek + Send + Unpin {}
+impl<T: AsyncRead + AsyncSeek + Send + Unpin> BlobRead for T {}
 
 /// Streaming hash state for writes: MD5 (ETag), optional additional checksum,
 /// and verification of client-supplied digests.
@@ -111,6 +113,9 @@ pub struct PutHasher {
     crc32c: u32,
     sha256: Option<(sha2::Sha256, [u8; 32])>,
     content_md5: Option<[u8; 16]>,
+    /// Requested S3 checksum algorithm.
+    algo: Option<ChecksumAlgo>,
+    /// Its hasher; None for CRC32C, which reuses the internal `crc32c`.
     checksum: Option<crate::checksum::ChecksumHasher>,
     expected_checksum: Option<Checksum>,
     expected_size: Option<u64>,
@@ -133,7 +138,8 @@ impl PutHasher {
             crc32c: 0,
             sha256: expect.sha256.map(|h| (sha2::Sha256::new(), h)),
             content_md5: expect.content_md5,
-            checksum: algo.map(crate::checksum::ChecksumHasher::new),
+            algo,
+            checksum: algo.filter(|a| *a != ChecksumAlgo::Crc32c).map(crate::checksum::ChecksumHasher::new),
             expected_checksum: expect.checksum.clone(),
             expected_size: expect.size,
             size: 0,
@@ -175,8 +181,16 @@ impl PutHasher {
             }
         }
         let mut checksum = None;
-        if let Some(h) = self.checksum {
-            let got = h.finish();
+        let computed = match self.checksum {
+            Some(h) => Some(h.finish()),
+            None if self.algo == Some(ChecksumAlgo::Crc32c) => {
+                use base64::Engine as _;
+                let value = base64::engine::general_purpose::STANDARD.encode(self.crc32c.to_be_bytes());
+                Some(Checksum { algo: ChecksumAlgo::Crc32c, value })
+            }
+            None => None,
+        };
+        if let Some(got) = computed {
             let expected = trailing.or(self.expected_checksum);
             if let Some(exp) = expected {
                 if exp.algo != got.algo {
@@ -206,6 +220,23 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn delete(&self, blob: &BlobRef) -> io::Result<()>;
     /// Make an independent copy of a blob (a hardlink when possible).
     async fn duplicate(&self, blob: &BlobRef) -> io::Result<BlobRef>;
+
+    /// Duplicate several blobs. All or nothing: on error no copies remain.
+    async fn duplicate_many(&self, blobs: &[BlobRef]) -> io::Result<Vec<BlobRef>> {
+        let mut out = Vec::with_capacity(blobs.len());
+        for b in blobs {
+            match self.duplicate(b).await {
+                Ok(d) => out.push(d),
+                Err(e) => {
+                    for d in &out {
+                        let _ = self.delete(d).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,21 +244,51 @@ pub trait BlobStore: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 const READ_CHUNK: usize = 256 * 1024;
+/// Chunks buffered between the reader task and the HTTP response.
+const STREAM_DEPTH: usize = 2;
 
-/// One opened blob of an object.
-pub struct ReadSegment {
-    pub blob: Box<dyn BlobRead>,
+/// One segment (blob) of an object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRef {
+    pub blob: BlobRef,
     pub size: u64,
     /// Expected CRC32C of the whole blob, when recorded.
     pub crc32c: Option<u32>,
-    /// Blob id, for integrity error reports.
-    pub id: String,
 }
 
-/// Opened object data, ready to stream. Holding it keeps the data readable even
-/// if the object is overwritten or deleted meanwhile.
-pub struct ObjectReader {
-    segments: Vec<ReadSegment>,
+/// Global limit on object bytes read from disk but not yet written to a socket.
+/// Each chunk holds its share until the HTTP layer drops it, so slow clients push
+/// back on disk reads instead of growing memory.
+#[derive(Clone)]
+pub struct ReadBudget {
+    sem: Arc<Semaphore>,
+    /// Size in KiB.
+    total: u32,
+}
+
+impl ReadBudget {
+    pub fn new(bytes: usize) -> Self {
+        let total = bytes.div_ceil(1024).clamp(1, u32::MAX as usize >> 4) as u32;
+        ReadBudget { sem: Arc::new(Semaphore::new(total as usize)), total }
+    }
+
+    async fn acquire(&self, bytes: usize) -> io::Result<OwnedSemaphorePermit> {
+        // A chunk larger than the whole budget takes all of it rather than waiting forever.
+        let kib = (bytes.div_ceil(1024) as u32).clamp(1, self.total);
+        self.sem.clone().acquire_many_owned(kib).await.map_err(io::Error::other)
+    }
+}
+
+/// A chunk of object data that returns its budget when dropped.
+struct Budgeted {
+    data: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for Budgeted {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 pub fn integrity_error(id: &str, what: &str) -> io::Error {
@@ -235,67 +296,114 @@ pub fn integrity_error(id: &str, what: &str) -> io::Error {
     io::Error::other(format!("integrity error in blob {id}: {what}"))
 }
 
+/// An object's data, ready to stream. Segments are opened lazily, only those the
+/// requested range touches, one at a time. `lease` keeps the blobs from being
+/// reclaimed until the reader is dropped, even if the object is overwritten.
+pub struct ObjectReader {
+    blobs: Arc<dyn BlobStore>,
+    segments: Vec<SegmentRef>,
+    /// Offset of each segment within the object.
+    starts: Vec<u64>,
+    budget: ReadBudget,
+    _lease: Option<Box<dyn Send + Sync>>,
+}
+
 impl ObjectReader {
-    pub fn new(segments: Vec<ReadSegment>) -> Self {
-        ObjectReader { segments }
+    pub fn new(blobs: Arc<dyn BlobStore>, segments: Vec<SegmentRef>, budget: ReadBudget, lease: Option<Box<dyn Send + Sync>>) -> Self {
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut at = 0;
+        for s in &segments {
+            starts.push(at);
+            at += s.size;
+        }
+        ObjectReader { blobs, segments, starts, budget, _lease: lease }
     }
 
-    /// Stream `len` bytes starting at `start` into a channel from a blocking thread.
+    /// Byte range (start, len) of part `n` (1-based) of a multipart object.
+    pub fn part_range(&self, n: u32) -> Option<(u64, u64)> {
+        let i = (n as usize).checked_sub(1)?;
+        Some((*self.starts.get(i)?, self.segments[i].size))
+    }
+
+    /// Segment containing byte `pos`, and the offset within it.
+    fn locate(&self, pos: u64) -> (usize, u64) {
+        let i = self.starts.partition_point(|s| *s <= pos).saturating_sub(1);
+        (i, pos - self.starts.get(i).copied().unwrap_or(0))
+    }
+
+    async fn open_segment(&self, i: usize, offset: u64) -> io::Result<Box<dyn BlobRead>> {
+        let seg = &self.segments[i];
+        let mut f = self.blobs.open(&seg.blob).await.map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound { integrity_error(&seg.blob.id, "blob file is missing") } else { e }
+        })?;
+        let len = f.seek(SeekFrom::End(0)).await?;
+        if len != seg.size {
+            return Err(integrity_error(&seg.blob.id, &format!("size is {len}, expected {}", seg.size)));
+        }
+        f.seek(SeekFrom::Start(offset)).await?;
+        Ok(f)
+    }
+
+    /// Start streaming `len` bytes from `start`. The first segment is opened before
+    /// this returns, so a missing or truncated blob fails the request up front.
     /// Segments read in full are verified against their CRC32C; the last chunk of a
     /// segment is only sent once it verifies, so corrupt data never arrives complete.
-    pub fn stream(self, start: u64, len: u64) -> mpsc::Receiver<io::Result<Bytes>> {
-        let (tx, rx) = mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = self.pump(start, len, &tx) {
-                let _ = tx.blocking_send(Err(e));
+    pub async fn open(self, start: u64, len: u64) -> io::Result<mpsc::Receiver<io::Result<Bytes>>> {
+        let (tx, rx) = mpsc::channel(STREAM_DEPTH);
+        if len == 0 || self.segments.is_empty() {
+            return Ok(rx);
+        }
+        let (idx, offset) = self.locate(start);
+        let first = self.open_segment(idx, offset).await?;
+        tokio::spawn(async move {
+            if let Err(e) = self.pump(first, idx, offset, len, &tx).await {
+                let _ = tx.send(Err(e)).await;
             }
         });
-        rx
+        Ok(rx)
     }
 
-    fn pump(self, mut start: u64, mut remaining: u64, tx: &mpsc::Sender<io::Result<Bytes>>) -> io::Result<()> {
-        for mut seg in self.segments {
-            if remaining == 0 {
-                break;
-            }
-            if start >= seg.size {
-                start -= seg.size;
-                continue;
-            }
-            seg.blob.seek(SeekFrom::Start(start))?;
-            let mut left = (seg.size - start).min(remaining);
-            let verify = seg.crc32c.filter(|_| start == 0 && left == seg.size);
-            start = 0;
+    async fn pump(&self, first: Box<dyn BlobRead>, mut idx: usize, mut offset: u64, mut remaining: u64, tx: &mpsc::Sender<io::Result<Bytes>>) -> io::Result<()> {
+        let mut next = Some(first);
+        while remaining > 0 && idx < self.segments.len() {
+            let seg = &self.segments[idx];
+            let mut f = match next.take() {
+                Some(f) => f,
+                None => self.open_segment(idx, offset).await?,
+            };
+            let mut left = (seg.size - offset).min(remaining);
+            let verify = seg.crc32c.filter(|_| offset == 0 && left == seg.size);
             let mut crc = 0u32;
-            let mut held: Option<Bytes> = None;
             while left > 0 {
                 let n = (left as usize).min(READ_CHUNK);
-                let mut buf = BytesMut::zeroed(n);
-                seg.blob.read_exact(&mut buf).map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof { integrity_error(&seg.id, "blob is truncated") } else { e }
-                })?;
+                // Never wait for budget while holding a budgeted chunk back: every
+                // chunk is sent before the next is acquired, so readers cannot
+                // deadlock each other (or themselves) on the shared budget.
+                let permit = self.budget.acquire(n).await?;
+                let mut buf = BytesMut::with_capacity(n);
+                while buf.len() < n {
+                    let want = (n - buf.len()) as u64;
+                    if (&mut f).take(want).read_buf(&mut buf).await? == 0 {
+                        return Err(integrity_error(&seg.blob.id, "blob is truncated"));
+                    }
+                }
                 left -= n as u64;
                 remaining -= n as u64;
-                if verify.is_some() {
+                if let Some(want) = verify {
                     crc = crc32c::crc32c_append(crc, &buf);
+                    // The segment's final chunk goes out only once the whole segment
+                    // verifies, so corrupt data never arrives complete.
+                    if left == 0 && crc != want {
+                        return Err(integrity_error(&seg.blob.id, "checksum mismatch"));
+                    }
                 }
-                if let Some(prev) = held.take()
-                    && tx.blocking_send(Ok(prev)).is_err()
-                {
+                let chunk = Bytes::from_owner(Budgeted { data: buf.freeze(), _permit: permit });
+                if tx.send(Ok(chunk)).await.is_err() {
                     return Ok(()); // client went away
                 }
-                held = Some(buf.freeze());
             }
-            if let Some(want) = verify
-                && crc != want
-            {
-                return Err(integrity_error(&seg.id, "checksum mismatch"));
-            }
-            if let Some(last) = held
-                && tx.blocking_send(Ok(last)).is_err()
-            {
-                return Ok(());
-            }
+            idx += 1;
+            offset = 0;
         }
         Ok(())
     }
@@ -359,8 +467,9 @@ pub struct ObjectInfo {
     pub last_modified: DateTime<Utc>,
     pub meta: ObjectMetadata,
     pub checksum: Option<Checksum>,
-    /// Sizes of the parts for multipart objects, empty otherwise.
-    pub parts: Vec<u64>,
+    /// Number of parts for multipart objects, 0 otherwise. Part sizes are available
+    /// from [`ObjectReader::part_range`].
+    pub parts_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -597,7 +706,8 @@ pub trait ObjectLayer: Send + Sync + 'static {
 
     async fn put_object(&self, bucket: &str, key: &str, src: &mut dyn ByteSource, opts: PutOptions) -> S3Result<ObjectInfo>;
     async fn head_object(&self, bucket: &str, key: &str) -> S3Result<ObjectInfo>;
-    /// Returns the object info plus opened data; conditions/ranges are evaluated by the caller.
+    /// Returns the object info plus a reader for its data (nothing is opened until
+    /// [`ObjectReader::open`]); conditions/ranges are evaluated by the caller.
     async fn get_object(&self, bucket: &str, key: &str) -> S3Result<(ObjectInfo, ObjectReader)>;
     async fn delete_object(&self, bucket: &str, key: &str) -> S3Result<()>;
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> S3Result<Vec<S3Result<()>>>;
