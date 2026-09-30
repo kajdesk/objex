@@ -17,7 +17,6 @@ services:
       OBJEX_REGION: auto
     volumes:
       - objex-data:/data       # object data and metadata
-      - objex-config:/config   # objex.toml, for keys added with `objex key add`
     ports:
       - "9000:9000"            # drop this if only other containers need access
     stop_grace_period: 30s     # lets in-flight uploads finish on shutdown
@@ -60,4 +59,3 @@ services:
 
 volumes:
   objex-data:
-  objex-config:

@@ -1,0 +1,14 @@
+{
+  "listen": "0.0.0.0:9000",
+  "data_dir": "./data",
+  "region": "auto",
+  "fsync": true,
+  "max_connections": 4096,
+  "keys": [
+    {
+      "name": "admin",
+      "access_key": "OBXCHANGE0000000001",
+      "secret_key": "change-me-to-a-long-random-secret"
+    }
+  ]
+}

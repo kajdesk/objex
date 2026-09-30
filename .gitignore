@@ -1,4 +1,4 @@
-/target
 /data
-objex.toml
+/bin
+objex.json
 .DS_Store

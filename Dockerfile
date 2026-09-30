@@ -1,32 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# ---- build ----
-FROM rust:1-bookworm AS build
+FROM golang:1.24-bookworm AS build
 WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin objex \
- && cp target/release/objex /objex
-# Directories the non-root runtime user must own (distroless has no shell).
-RUN mkdir -p /out/data /out/config && chown -R 65532:65532 /out
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+COPY pkg ./pkg
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    mkdir -p /out && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/objex ./cmd/objex
+RUN mkdir -p /out/data /out/config && chown -R 65532:65532 /out/data /out/config
 
-# ---- runtime ----
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.licenses="Elastic-2.0" \
       org.opencontainers.image.source="https://github.com/kajdesk/objex"
-COPY --from=build /objex /usr/local/bin/objex
+COPY --from=build /out/objex /usr/local/bin/objex
 COPY LICENSE NOTICE /usr/share/doc/objex/
 COPY --from=build --chown=65532:65532 /out/data /data
 COPY --from=build --chown=65532:65532 /out/config /config
 
 ENV OBJEX_LISTEN=0.0.0.0:9000 \
     OBJEX_DATA_DIR=/data \
-    OBJEX_CONFIG=/config/objex.toml
+    OBJEX_CONFIG=/config/objex.json
 
 USER 65532:65532
 VOLUME ["/data"]
 EXPOSE 9000
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 CMD ["/usr/local/bin/objex", "health"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 CMD ["/usr/local/bin/objex", "health", "http://127.0.0.1:9000/_objex/health"]
 ENTRYPOINT ["/usr/local/bin/objex"]
-CMD ["server"]
