@@ -46,7 +46,7 @@ The image is multi-arch (`linux/amd64`, `linux/arm64`), about 45 MB, runs as a n
 Each [release](https://github.com/kajdesk/objex/releases) has archives for Linux (x86_64, arm64; statically linked, no dependencies) and macOS (Apple Silicon, Intel), each with a `.sha256` checksum.
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.1.1
 TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
 curl -LO https://github.com/kajdesk/objex/releases/download/$VERSION/objex-$VERSION-$TARGET.tar.gz
 tar xzf objex-$VERSION-$TARGET.tar.gz

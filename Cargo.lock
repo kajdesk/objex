@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "objex"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "aws-credential-types",
