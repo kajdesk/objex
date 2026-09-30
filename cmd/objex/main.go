@@ -20,6 +20,9 @@ import (
 	"github.com/kajdesk/objex/internal/storage/local"
 )
 
+// version is set at build time: -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 const usage = `usage: objex <command> [flags]
 
 commands:
@@ -30,6 +33,7 @@ commands:
   key rm <key-or-name>   remove an access key
   scrub                  verify every stored blob (server must be stopped)
   health [URL]           check that a server is up (for healthchecks)
+  version                print the version
 
 Common flag: -config (default objex.json, or $OBJEX_CONFIG)`
 
@@ -107,6 +111,9 @@ func run(args []string) error {
 			url = fs.Arg(0)
 		}
 		return health(url)
+	case "version", "-version", "--version":
+		fmt.Println("objex", version)
+		return nil
 	case "help", "-h", "--help":
 		fmt.Println(usage)
 		return nil
@@ -127,7 +134,7 @@ func serve(cfg config.Config, configPath string) error {
 	defer srv.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	logger.Info("objex listening", "address", cfg.Listen, "data", cfg.DataDir, "fsync", cfg.Fsync)
+	logger.Info("objex listening", "version", version, "address", cfg.Listen, "data", cfg.DataDir, "fsync", cfg.Fsync)
 	return srv.Run(ctx)
 }
 

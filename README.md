@@ -56,6 +56,21 @@ docker run -d --name objex -p 9000:9000 \
 The image runs as a non-root user and includes a healthcheck. Mount persistent
 storage at `/data`.
 
+### Prebuilt binary
+
+Each [release](https://github.com/kajdesk/objex/releases) has static binaries
+for Linux and macOS (`linux-amd64`, `linux-arm64`, `darwin-arm64`,
+`darwin-amd64`), each with a `.sha256` checksum:
+
+```sh
+VERSION=v0.2.0
+TARGET=linux-amd64
+curl -LO https://github.com/kajdesk/objex/releases/download/$VERSION/objex-$VERSION-$TARGET.tar.gz
+tar xzf objex-$VERSION-$TARGET.tar.gz
+sudo install objex-$VERSION-$TARGET/objex /usr/local/bin/
+objex version
+```
+
 ### From source
 
 Go 1.24 or newer is required.

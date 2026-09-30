@@ -37,7 +37,7 @@ jobs:
         run: |
           name=objex-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p "dist/$name"
-          go build -trimpath -ldflags="-s -w" -o "dist/$name/objex" ./cmd/objex
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$name/objex" ./cmd/objex
           cp README.md LICENSE NOTICE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
@@ -83,6 +83,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

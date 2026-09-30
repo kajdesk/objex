@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
 FROM golang:1.24-bookworm AS build
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -9,7 +10,7 @@ COPY internal ./internal
 COPY pkg ./pkg
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    mkdir -p /out && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/objex ./cmd/objex
+    mkdir -p /out && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/objex ./cmd/objex
 RUN mkdir -p /out/data /out/config && chown -R 65532:65532 /out/data /out/config
 
 FROM gcr.io/distroless/static-debian12:nonroot
