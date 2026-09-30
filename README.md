@@ -4,27 +4,42 @@ objex is a lightweight S3-compatible object storage server written in Go. It
 runs as a single process and stores transactional metadata in bbolt alongside
 immutable object blobs on the local filesystem.
 
-> **Status:** early development. The core single-node API works, but the
-> compatibility gaps listed below should be reviewed before production use.
+> **Status:** early development, single node. The full first-release S3 API
+> is implemented and tested against the official AWS SDK for Go.
 
 ## Features
 
-- S3 Signature Version 4 header authentication and presigned URLs.
-- Multiple access keys, optional bucket restrictions, and read-only keys.
-- Path-style and virtual-host-style bucket addressing.
-- Create, list, inspect, locate, and delete buckets.
-- Put, get, inspect, and delete objects.
-- Range reads, standard object metadata, user metadata, and conditional reads.
-- ListObjects V1/V2 with prefix, delimiter, markers, and continuation tokens.
-- Private buckets and buckets created with the `public-read` canned ACL.
-- Streaming uploads with SHA-256 verification, MD5 ETags, and internal CRC32C.
-- Durable local storage by default, graceful shutdown, connection limits, and a
-  health endpoint.
+- **S3 / R2 API compatible:** works with the AWS SDKs and CLI, rclone, boto3,
+  s3cmd and anything else that speaks S3.
+- **SigV4 authentication:** header auth, presigned URLs, and streaming
+  `aws-chunked` uploads (signed, unsigned, and with trailing checksums), which
+  current AWS SDKs use over HTTPS. Any region is accepted, including `auto`.
+- **Access keys:** multiple keys, optional bucket restrictions, read-only keys,
+  managed with `objex key` and picked up by a running server within seconds.
+- **Buckets:** create, delete, head, list, location, private or `public-read`,
+  bucket ACLs, and bucket CORS with OPTIONS preflight.
+- **Objects:** put, get, head, delete, batch delete, copy (hard links, so copies
+  are instant), Range reads, `partNumber` reads, user metadata, `response-*`
+  overrides, and conditional requests (`If-Match`, `If-None-Match`,
+  `If-Modified-Since`, `If-Unmodified-Since`, `If-None-Match: *` on PUT).
+- **Listing:** ListObjects V1 and V2 with prefix, delimiter, pagination and
+  `encoding-type=url`; common prefixes are skipped in one seek, not scanned.
+- **Multipart uploads:** create, upload part, upload part copy (with ranges),
+  complete, abort, list parts, list uploads. Completing copies no data.
+- **Checksums:** CRC32, CRC32C, CRC64NVME, SHA1 and SHA256 are verified on
+  upload and returned with `x-amz-checksum-mode`, including composite and
+  full-object multipart checksums.
+- **Integrity:** every blob carries a CRC32C. Full reads are verified before
+  their last bytes are sent, a background scrub re-checks everything weekly,
+  and `objex scrub` does it offline.
+- **Durable by default:** data and metadata are flushed before a write is
+  acknowledged; concurrent writes share one metadata flush (group commit).
+- **Addressing:** path-style (`host/bucket/key`) and virtual-host style
+  (`bucket.domain/key`).
 
-Not implemented yet: multipart uploads, object copy, batch delete, streaming
-`aws-chunked` decoding, CORS mutation, the full S3 checksum family, background
-scrubbing/repair, and live key management. Unsupported operations return an S3
-`NotImplemented` response.
+Not supported: versioning, object tagging, lifecycle rules, object lock,
+server-side encryption, bucket policies, SigV2 and SigV4a. These return S3
+`NotImplemented` (or report "not configured").
 
 ## Install
 
@@ -52,33 +67,50 @@ go build -trimpath -o ./bin/objex-bench ./cmd/objex-bench
 
 ## Quick start
 
-The simplest development setup uses environment credentials:
-
 ```sh
-export OBJEX_ACCESS_KEY=OBXCHANGEME000000001
-export OBJEX_SECRET_KEY=change-me-to-a-long-random-secret
-./bin/objex server -listen 127.0.0.1:9000 -data ./data
+objex init                       # writes objex.json (owner-only; it holds secrets)
+objex key add admin              # prints an access key and secret
+objex server -data ./data
 ```
 
-Use the endpoint with the AWS CLI:
+Or, without a config file:
 
 ```sh
-export AWS_ACCESS_KEY_ID="$OBJEX_ACCESS_KEY"
-export AWS_SECRET_ACCESS_KEY="$OBJEX_SECRET_KEY"
+OBJEX_ACCESS_KEY=OBXCHANGEME000000001 OBJEX_SECRET_KEY=change-me-to-a-long-random-secret \
+  objex server -listen 127.0.0.1:9000 -data ./data
+```
+
+Use it with the AWS CLI:
+
+```sh
+export AWS_ACCESS_KEY_ID=<access key> AWS_SECRET_ACCESS_KEY=<secret>
 aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://photos
 aws --endpoint-url http://127.0.0.1:9000 s3 cp ./cat.jpg s3://photos/
 aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://photos/
 ```
 
 Use path-style addressing when the endpoint hostname cannot resolve bucket
-subdomains. For example, set `forcePathStyle: true` in the JavaScript AWS SDK or
-`addressing_style: "path"` in boto3.
+subdomains: `forcePathStyle: true` in the JavaScript SDK, `addressing_style:
+"path"` in boto3, `UsePathStyle: true` in Go.
+
+## Commands
+
+```text
+objex server [-config f] [-listen addr] [-data dir] [-no-fsync]
+objex init                                   write a default config file
+objex key add <name> [-bucket b]... [-read-only]
+objex key list
+objex key rm <access-key-or-name>
+objex scrub [-data dir]                      verify every blob (server stopped)
+objex health [URL]                           probe a server (healthchecks)
+```
+
+Key changes are picked up by a running server within two seconds.
 
 ## Configuration
 
-objex reads `objex.json` by default. Select another file with `-config` or
-`OBJEX_CONFIG`. A missing file is allowed, which makes an environment-only
-configuration convenient for containers.
+objex reads `objex.json` by default (`-config` or `OBJEX_CONFIG` to change).
+A missing file is allowed. Unknown fields are rejected, so typos fail loudly.
 
 ```json
 {
@@ -87,37 +119,45 @@ configuration convenient for containers.
   "region": "auto",
   "domain": "s3.example.com",
   "fsync": true,
+  "verify_reads": true,
   "max_connections": 4096,
+  "scrub_interval_hours": 168,
+  "scrub_mb_per_sec": 64,
+  "gc_interval_hours": 24,
   "keys": [
-    {
-      "name": "admin",
-      "access_key": "OBX...",
-      "secret_key": "replace-with-a-long-random-secret"
-    }
+    { "name": "admin", "access_key": "OBX...", "secret_key": "..." },
+    { "name": "viewer", "access_key": "OBX...", "secret_key": "...", "buckets": ["photos"], "read_only": true }
   ]
 }
 ```
 
-Supported environment overrides:
+Environment overrides: `OBJEX_LISTEN`, `OBJEX_DATA_DIR`, `OBJEX_REGION`,
+`OBJEX_DOMAIN`, `OBJEX_FSYNC`, `OBJEX_VERIFY_READS`, `OBJEX_MAX_CONNECTIONS`,
+`OBJEX_SCRUB_INTERVAL_HOURS`, `OBJEX_SCRUB_MB_PER_SEC`,
+`OBJEX_GC_INTERVAL_HOURS`, `OBJEX_LOG` (`debug`, `info`, `warn`), and
+`OBJEX_ACCESS_KEY` + `OBJEX_SECRET_KEY` for a key.
 
-- `OBJEX_CONFIG`
-- `OBJEX_LISTEN`
-- `OBJEX_DATA_DIR`
-- `OBJEX_REGION`
-- `OBJEX_DOMAIN`
-- `OBJEX_FSYNC`
-- `OBJEX_MAX_CONNECTIONS`
-- `OBJEX_ACCESS_KEY` and `OBJEX_SECRET_KEY`
+Disabling fsync improves write throughput, but acknowledged writes may be lost
+after a crash or power failure.
 
-Command-line flags override the loaded configuration:
+## Deployment
 
-```sh
-objex server -config ./objex.json -listen 0.0.0.0:9000 -data ./data
-objex server -config ./objex.json -no-fsync
-```
+objex speaks plain HTTP. Put a TLS-terminating reverse proxy (Caddy, nginx, a
+load balancer) in front for anything beyond a trusted network, with a body size
+limit of at least 5 GiB. Request headers must arrive within 30 seconds, a
+stalled request body is dropped after 60 seconds, and at most
+`max_connections` connections are served at once. Only one objex process may
+use a data directory; a second one refuses to start.
 
-Disabling fsync improves write throughput but means acknowledged writes may be
-lost after a crash or power failure.
+### Durability
+
+With `fsync` on, a write is acknowledged only after the object data is flushed,
+any new shard directories and the blob's directory entry are flushed, and the
+metadata transaction commits with a full flush. On macOS the blob flushes use
+`fsync` and the metadata commit uses `F_FULLFSYNC`, which forces the drive
+cache, and so everything written before it, to stable storage. This ordering
+has been reviewed but not power-cut tested; it relies on the filesystem
+honoring `fsync` on files and directories (ext4, XFS and APFS do).
 
 ## Health checks
 
@@ -136,27 +176,28 @@ objex health http://127.0.0.1:9000/_objex/health
 ## Architecture
 
 ```text
-cmd/
-  objex/          server and health-check executable
-  objex-bench/    endpoint benchmark
+cmd/objex/          server, init, key, scrub and health commands
+cmd/objex-bench/    throughput benchmark
 internal/
-  auth/           SigV4 verification
-  config/         JSON and environment configuration
-  s3/             S3 routing and XML responses
-  server/         HTTP lifecycle and connection limits
-  storage/        storage contracts
-    local/        bbolt metadata and immutable local blobs
-pkg/
-  sigv4/          reusable request signer
+  auth/             SigV4 verification and aws-chunked decoding
+  checksum/         S3 checksum algorithms, composite and full-object combining
+  config/           JSON configuration and key management
+  s3/               S3 routing, handlers, XML and CORS
+  s3err/            S3 error codes
+  server/           HTTP lifecycle, limits, key reload, scheduled GC and scrub
+  storage/          storage contract
+    local/          bbolt metadata + immutable blob files
+  e2e/              end-to-end tests with the AWS SDK for Go
+pkg/sigv4/          reusable request signer
 ```
 
-Metadata is committed transactionally in `meta.db`. Object bodies are streamed
-into temporary files while hashes are calculated, then renamed into sharded
-paths under `blobs/`. Metadata is committed only after the blob is in place.
-Overwrites publish new immutable blobs and reclaim the old blobs after commit.
-
-The storage interface is kept behind `internal/storage`, allowing another
-backend to be added without coupling it to HTTP routing or authentication.
+Metadata lives in `meta.db` (bbolt). Object data is written to `tmp/` while
+MD5, CRC32C and any requested checksums are computed, flushed, and renamed
+into `blobs/ab/cd/<id>`; only then is the metadata committed, together with
+concurrent writes. Replaced and deleted blobs are removed in the background,
+never while a download is still reading them. Multipart completion and copies
+move no data. GC removes blob files that metadata does not reference, such as
+those left by a crash between writing and committing.
 
 ## Docker Compose
 

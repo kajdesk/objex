@@ -1,14 +1,17 @@
+// Package s3 is the S3 HTTP API: request parsing, routing, authorization and
+// responses.
 package s3
 
 import (
-	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,528 +20,371 @@ import (
 	"time"
 
 	"github.com/kajdesk/objex/internal/auth"
-	"github.com/kajdesk/objex/internal/config"
+	"github.com/kajdesk/objex/internal/checksum"
+	"github.com/kajdesk/objex/internal/s3err"
 	"github.com/kajdesk/objex/internal/storage"
 )
 
-const namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
+// HealthPath is an unauthenticated liveness endpoint. The underscore makes it
+// an invalid bucket name, so it can never shadow a real bucket.
+const HealthPath = "/_objex/health"
 
-type Handler struct {
-	store    storage.Store
-	auth     *auth.Verifier
-	region   string
-	domain   string
-	maxWrite int64
+const (
+	xmlns       = "http://s3.amazonaws.com/doc/2006-03-01/"
+	maxXMLBody  = 4 << 20 // DeleteObjects with 1000 long keys fits
+	allUsersURI = "http://acs.amazonaws.com/groups/global/AllUsers"
+)
+
+// Options configures the handler.
+type Options struct {
+	// Region is reported to clients (any signed region is accepted).
+	Region string
+	// Domain enables virtual-host addressing (bucket.domain); empty disables it.
+	Domain string
 }
 
-func New(store storage.Store, cfg config.Config) *Handler {
-	return &Handler{
-		store: store, auth: auth.New(cfg.Keys), region: cfg.Region,
-		domain: strings.ToLower(strings.Trim(cfg.Domain, ".")), maxWrite: 5 << 30,
-	}
+// Handler serves the S3 API.
+type Handler struct {
+	store  storage.Store
+	auth   *auth.Verifier
+	region string
+	domain string
+}
+
+func New(store storage.Store, verifier *auth.Verifier, o Options) *Handler {
+	return &Handler{store: store, auth: verifier, region: o.Region, domain: strings.ToLower(strings.Trim(o.Domain, "."))}
+}
+
+// request is the per-request context.
+type request struct {
+	w           http.ResponseWriter
+	r           *http.Request
+	query       url.Values
+	bucket, key string
+	auth        auth.Result
+	id          string
+}
+
+func (q *request) has(name string) bool { _, ok := q.query[name]; return ok }
+func (q *request) q(name string) string { return q.query.Get(name) }
+func (q *request) header(name string) string {
+	return q.r.Header.Get(name)
+}
+
+func requestID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return strings.ToUpper(hex.EncodeToString(b[:]))
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	requestID := randomRequestID()
-	w.Header().Set("Server", "objex")
-	w.Header().Set("X-Amz-Request-Id", requestID)
-	if r.URL.Path == "/_objex/health" {
+	if r.URL.Path == HealthPath && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
-	bucket, key, err := h.splitPath(r)
-	if err != nil {
-		h.writeError(w, r, requestID, apiError("InvalidArgument", http.StatusBadRequest, err.Error()))
+	q := &request{w: w, r: r, id: requestID()}
+	w.Header().Set("Server", "objex")
+	w.Header().Set("X-Amz-Request-Id", q.id)
+	var err error
+	if q.bucket, q.key, err = h.splitPath(r); err != nil {
+		h.writeError(q, s3err.InvalidArgument.WithMessage("Invalid URI encoding"))
 		return
 	}
-	authResult, err := h.auth.Authenticate(r, time.Now())
-	if err != nil {
-		h.writeError(w, r, requestID, fromAuthError(err))
-		return
-	}
-	if err := h.authorize(r.Context(), authResult.Key, r.Method, bucket, key); err != nil {
-		h.writeError(w, r, requestID, err)
-		return
-	}
-	if err := h.route(w, r, authResult, bucket, key); err != nil {
-		h.writeError(w, r, requestID, err)
-	}
-}
-
-func (h *Handler) authorize(ctx context.Context, keyConfig *config.Key, method, bucket, objectKey string) error {
-	if keyConfig == nil {
-		if bucket != "" && (method == http.MethodGet || method == http.MethodHead) {
-			info, err := h.store.GetBucket(ctx, bucket)
-			if err == nil && info.PublicRead {
-				return nil
-			}
-		}
-		return apiError("AccessDenied", http.StatusForbidden, "Access Denied")
-	}
-	if bucket != "" && !keyConfig.CanAccess(bucket) {
-		return apiError("AccessDenied", http.StatusForbidden, "Access Denied")
-	}
-	if keyConfig.ReadOnly && method != http.MethodGet && method != http.MethodHead {
-		return apiError("AccessDenied", http.StatusForbidden, "Access Denied")
-	}
-	return nil
-}
-
-func (h *Handler) route(w http.ResponseWriter, r *http.Request, result auth.Result, bucket, key string) error {
-	query := r.URL.Query()
-	if query.Has("uploads") || query.Has("uploadId") || query.Has("partNumber") || r.Header.Get("X-Amz-Copy-Source") != "" {
-		return apiError("NotImplemented", http.StatusNotImplemented, "multipart upload and copy are not implemented in the Go milestone yet")
-	}
-	if bucket == "" {
-		if r.Method != http.MethodGet {
-			return methodNotAllowed()
-		}
-		return h.listBuckets(w, r)
-	}
-	if key == "" {
-		switch r.Method {
-		case http.MethodPut:
-			return h.createBucket(w, r, bucket)
-		case http.MethodHead:
-			return h.headBucket(w, r, bucket)
-		case http.MethodDelete:
-			return h.deleteBucket(w, r, bucket)
-		case http.MethodGet:
-			if query.Has("location") {
-				return h.bucketLocation(w, r, bucket)
-			}
-			return h.listObjects(w, r, bucket)
-		default:
-			return methodNotAllowed()
+	// CORS headers go on every response to a matching origin, errors included,
+	// so they are set before anything is written.
+	if origin := r.Header.Get("Origin"); origin != "" && q.bucket != "" && r.Method != http.MethodOptions {
+		if b, berr := h.store.GetBucket(r.Context(), q.bucket); berr == nil {
+			applyCORS(b.CORS, origin, r.Method, w.Header())
 		}
 	}
-	switch r.Method {
-	case http.MethodPut:
-		return h.putObject(w, r, result, bucket, key)
-	case http.MethodGet:
-		return h.getObject(w, r, bucket, key, false)
-	case http.MethodHead:
-		return h.getObject(w, r, bucket, key, true)
-	case http.MethodDelete:
-		return h.deleteObject(w, r, bucket, key)
-	default:
-		return methodNotAllowed()
+	if err := h.serve(q); err != nil {
+		h.writeError(q, err)
 	}
 }
 
-func (h *Handler) listBuckets(w http.ResponseWriter, r *http.Request) error {
-	buckets, err := h.store.ListBuckets(r.Context())
-	if err != nil {
-		return internalError(err)
+func (h *Handler) serve(q *request) error {
+	var err error
+	if q.r.Method == http.MethodOptions {
+		return h.preflight(q)
 	}
-	type item struct {
-		Name         string `xml:"Name"`
-		CreationDate string `xml:"CreationDate"`
+	if q.query, err = url.ParseQuery(q.r.URL.RawQuery); err != nil {
+		return s3err.InvalidArgument.WithMessage("Invalid query string")
 	}
-	response := struct {
-		XMLName xml.Name `xml:"ListAllMyBucketsResult"`
-		XMLNS   string   `xml:"xmlns,attr"`
-		Owner   owner    `xml:"Owner"`
-		Buckets []item   `xml:"Buckets>Bucket"`
-	}{XMLNS: namespace, Owner: defaultOwner()}
-	for _, bucket := range buckets {
-		response.Buckets = append(response.Buckets, item{Name: bucket.Name, CreationDate: iso8601(bucket.Created)})
-	}
-	writeXML(w, http.StatusOK, response)
-	return nil
-}
-
-func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	public := strings.EqualFold(r.Header.Get("X-Amz-Acl"), "public-read")
-	if err := h.store.CreateBucket(r.Context(), bucket, public); err != nil {
-		return fromStorageError(err)
-	}
-	w.Header().Set("Location", "/"+bucket)
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func (h *Handler) headBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if _, err := h.store.GetBucket(r.Context(), bucket); err != nil {
-		return fromStorageError(err)
-	}
-	w.Header().Set("X-Amz-Bucket-Region", h.region)
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if err := h.store.DeleteBucket(r.Context(), bucket); err != nil {
-		return fromStorageError(err)
-	}
-	w.WriteHeader(http.StatusNoContent)
-	return nil
-}
-
-func (h *Handler) bucketLocation(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if _, err := h.store.GetBucket(r.Context(), bucket); err != nil {
-		return fromStorageError(err)
-	}
-	region := h.region
-	if region == "us-east-1" {
-		region = ""
-	}
-	response := struct {
-		XMLName xml.Name `xml:"LocationConstraint"`
-		XMLNS   string   `xml:"xmlns,attr"`
-		Value   string   `xml:",chardata"`
-	}{XMLNS: namespace, Value: region}
-	writeXML(w, http.StatusOK, response)
-	return nil
-}
-
-func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, result auth.Result, bucket, key string) error {
-	if r.ContentLength < 0 && len(r.TransferEncoding) == 0 {
-		return apiError("MissingContentLength", http.StatusLengthRequired, "You must provide the Content-Length HTTP header")
-	}
-	options := storage.PutOptions{
-		Metadata: storage.Metadata{
-			ContentType: r.Header.Get("Content-Type"), ContentEncoding: r.Header.Get("Content-Encoding"),
-			ContentDisposition: r.Header.Get("Content-Disposition"), ContentLanguage: r.Header.Get("Content-Language"),
-			CacheControl: r.Header.Get("Cache-Control"), Expires: r.Header.Get("Expires"), User: userMetadata(r.Header),
-		},
-		MaxSize: h.maxWrite, SHA256: result.ExpectedSHA256,
-		IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match"),
-	}
-	obj, err := h.store.PutObject(r.Context(), bucket, key, r.Body, options)
-	if err != nil {
-		if strings.Contains(err.Error(), "SHA256") {
-			return apiError("XAmzContentSHA256Mismatch", http.StatusBadRequest, "payload checksum did not match")
-		}
-		return fromStorageError(err)
-	}
-	w.Header().Set("ETag", quoteETag(obj.ETag))
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func (h *Handler) getObject(w http.ResponseWriter, r *http.Request, bucket, key string, head bool) error {
-	obj, file, err := h.store.OpenObject(r.Context(), bucket, key)
-	if err != nil {
-		return fromStorageError(err)
-	}
-	defer file.Close()
-	if err := checkReadConditions(r, obj); err != nil {
+	if q.auth, err = h.auth.Authenticate(q.r, time.Now()); err != nil {
 		return err
 	}
-	start, length, partial, err := resolveRange(r.Header.Get("Range"), obj.Size)
+	op, err := route(q)
 	if err != nil {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", obj.Size))
-		return apiError("InvalidRange", http.StatusRequestedRangeNotSatisfiable, "The requested range is not satisfiable")
+		return err
 	}
-	setObjectHeaders(w.Header(), obj)
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	if partial {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, obj.Size))
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
+	if err := h.authorize(q, op); err != nil {
+		return err
 	}
-	if head || length == 0 {
-		return nil
-	}
-	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return internalError(err)
-	}
-	_, err = io.CopyN(w, file, length)
-	return err
+	return op.run(h, q)
 }
 
-func (h *Handler) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	if err := h.store.DeleteObject(r.Context(), bucket, key); err != nil {
-		return fromStorageError(err)
-	}
-	w.WriteHeader(http.StatusNoContent)
-	return nil
-}
-
-func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket string) error {
-	query := r.URL.Query()
-	limit := 1000
-	if raw := query.Get("max-keys"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 0 {
-			return apiError("InvalidArgument", http.StatusBadRequest, "max-keys must be a non-negative integer")
-		}
-		if parsed < limit {
-			limit = parsed
-		}
-	}
-	v2 := query.Get("list-type") == "2"
-	marker := query.Get("marker")
-	if v2 {
-		marker = query.Get("start-after")
-		if token := query.Get("continuation-token"); token != "" {
-			decoded, err := base64.RawURLEncoding.DecodeString(token)
-			if err != nil {
-				return apiError("InvalidArgument", http.StatusBadRequest, "invalid continuation token")
-			}
-			marker = string(decoded)
-		}
-	}
-	result, err := h.store.ListObjects(r.Context(), bucket, storage.ListOptions{
-		Prefix: query.Get("prefix"), Delimiter: query.Get("delimiter"), Marker: marker, Limit: limit,
-	})
-	if err != nil {
-		return fromStorageError(err)
-	}
-	type content struct {
-		Key          string `xml:"Key"`
-		LastModified string `xml:"LastModified"`
-		ETag         string `xml:"ETag"`
-		Size         int64  `xml:"Size"`
-		StorageClass string `xml:"StorageClass"`
-	}
-	type commonPrefix struct {
-		Prefix string `xml:"Prefix"`
-	}
-	response := struct {
-		XMLName               xml.Name       `xml:"ListBucketResult"`
-		XMLNS                 string         `xml:"xmlns,attr"`
-		Name                  string         `xml:"Name"`
-		Prefix                string         `xml:"Prefix"`
-		Marker                string         `xml:"Marker,omitempty"`
-		MaxKeys               int            `xml:"MaxKeys"`
-		KeyCount              *int           `xml:"KeyCount,omitempty"`
-		IsTruncated           bool           `xml:"IsTruncated"`
-		NextMarker            string         `xml:"NextMarker,omitempty"`
-		ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
-		NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
-		Contents              []content      `xml:"Contents"`
-		CommonPrefixes        []commonPrefix `xml:"CommonPrefixes"`
-	}{XMLNS: namespace, Name: bucket, Prefix: query.Get("prefix"), Marker: marker, MaxKeys: limit, IsTruncated: result.Truncated}
-	for _, obj := range result.Objects {
-		response.Contents = append(response.Contents, content{Key: obj.Key, LastModified: iso8601(obj.LastModified), ETag: quoteETag(obj.ETag), Size: obj.Size, StorageClass: "STANDARD"})
-	}
-	for _, prefix := range result.Prefixes {
-		response.CommonPrefixes = append(response.CommonPrefixes, commonPrefix{Prefix: prefix})
-	}
-	if v2 {
-		count := len(result.Objects) + len(result.Prefixes)
-		response.KeyCount = &count
-		response.Marker = ""
-		response.ContinuationToken = query.Get("continuation-token")
-		if result.Truncated {
-			response.NextContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(result.NextMarker))
-		}
-	} else if result.Truncated {
-		response.NextMarker = result.NextMarker
-	}
-	writeXML(w, http.StatusOK, response)
-	return nil
-}
-
+// splitPath extracts (bucket, key) for path-style and virtual-host requests.
 func (h *Handler) splitPath(r *http.Request) (string, string, error) {
-	host := r.Host
-	if parsed, _, err := net.SplitHostPort(host); err == nil {
-		host = parsed
-	}
+	path := r.URL.EscapedPath()
 	if h.domain != "" {
-		lower := strings.ToLower(strings.TrimSuffix(host, "."))
-		if prefix, ok := strings.CutSuffix(lower, "."+h.domain); ok && prefix != "" {
-			key, err := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/"))
-			return prefix, key, err
+		host := strings.ToLower(r.Host)
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+		if b, ok := strings.CutSuffix(host, "."+h.domain); ok && b != "" {
+			key, err := url.PathUnescape(strings.TrimPrefix(path, "/"))
+			return b, key, err
 		}
 	}
-	path := strings.TrimPrefix(r.URL.EscapedPath(), "/")
-	bucketRaw, keyRaw, hasKey := strings.Cut(path, "/")
-	bucket, err := url.PathUnescape(bucketRaw)
+	rawBucket, rawKey, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
+	bucket, err := url.PathUnescape(rawBucket)
 	if err != nil {
 		return "", "", err
 	}
-	if !hasKey {
-		return bucket, "", nil
-	}
-	key, err := url.PathUnescape(keyRaw)
+	key, err := url.PathUnescape(rawKey)
 	return bucket, key, err
 }
 
-type apiErr struct {
-	Code    string
-	Status  int
-	Message string
-}
-
-func (e *apiErr) Error() string { return e.Code + ": " + e.Message }
-func apiError(code string, status int, message string) error {
-	return &apiErr{Code: code, Status: status, Message: message}
-}
-func internalError(err error) error {
-	return apiError("InternalError", http.StatusInternalServerError, err.Error())
-}
-func methodNotAllowed() error {
-	return apiError("MethodNotAllowed", http.StatusMethodNotAllowed, "The specified method is not allowed")
-}
-
-func fromAuthError(err error) error {
-	var authErr *auth.Error
-	if errors.As(err, &authErr) {
-		status := http.StatusForbidden
-		if authErr.Code == "AuthorizationHeaderMalformed" || authErr.Code == "AuthorizationQueryParametersError" || authErr.Code == "InvalidArgument" {
-			status = http.StatusBadRequest
+func (h *Handler) authorize(q *request, op operation) error {
+	key := q.auth.Key
+	if key == nil {
+		if op.publicRead && q.bucket != "" {
+			b, err := h.store.GetBucket(q.r.Context(), q.bucket)
+			if err != nil {
+				return err
+			}
+			if b.PublicRead {
+				return nil
+			}
 		}
-		return apiError(authErr.Code, status, authErr.Message)
+		return s3err.AccessDenied
 	}
-	return internalError(err)
-}
-
-func fromStorageError(err error) error {
-	switch {
-	case errors.Is(err, storage.ErrNoSuchBucket):
-		return apiError("NoSuchBucket", http.StatusNotFound, "The specified bucket does not exist")
-	case errors.Is(err, storage.ErrBucketExists):
-		return apiError("BucketAlreadyOwnedByYou", http.StatusConflict, "The bucket already exists")
-	case errors.Is(err, storage.ErrBucketNotEmpty):
-		return apiError("BucketNotEmpty", http.StatusConflict, "The bucket is not empty")
-	case errors.Is(err, storage.ErrNoSuchKey):
-		return apiError("NoSuchKey", http.StatusNotFound, "The specified key does not exist")
-	case errors.Is(err, storage.ErrPreconditionFailed):
-		return apiError("PreconditionFailed", http.StatusPreconditionFailed, "A precondition did not hold")
-	case errors.Is(err, storage.ErrEntityTooLarge):
-		return apiError("EntityTooLarge", http.StatusBadRequest, "The object is too large")
-	default:
-		if strings.Contains(err.Error(), "invalid bucket") {
-			return apiError("InvalidBucketName", http.StatusBadRequest, "The specified bucket is not valid")
-		}
-		return internalError(err)
+	write := q.r.Method != http.MethodGet && q.r.Method != http.MethodHead
+	if write && key.ReadOnly {
+		return s3err.AccessDenied
 	}
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, requestID string, err error) {
-	api := &apiErr{Code: "InternalError", Status: http.StatusInternalServerError, Message: err.Error()}
-	_ = errors.As(err, &api)
-	if r.Method == http.MethodHead {
-		w.WriteHeader(api.Status)
-		return
+	if q.bucket != "" && !key.CanAccess(q.bucket) {
+		return s3err.AccessDenied
 	}
-	response := struct {
-		XMLName   xml.Name `xml:"Error"`
-		Code      string   `xml:"Code"`
-		Message   string   `xml:"Message"`
-		Resource  string   `xml:"Resource"`
-		RequestID string   `xml:"RequestId"`
-	}{Code: api.Code, Message: api.Message, Resource: r.URL.Path, RequestID: requestID}
-	writeXML(w, api.Status, response)
-}
-
-type owner struct {
-	ID          string `xml:"ID"`
-	DisplayName string `xml:"DisplayName"`
-}
-
-func defaultOwner() owner { return owner{ID: "objex", DisplayName: "objex"} }
-
-func writeXML(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(status)
-	_, _ = io.WriteString(w, xml.Header)
-	_ = xml.NewEncoder(w).Encode(value)
-}
-
-func setObjectHeaders(header http.Header, obj storage.Object) {
-	header.Set("ETag", quoteETag(obj.ETag))
-	header.Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
-	header.Set("Accept-Ranges", "bytes")
-	header.Set("X-Amz-Storage-Class", "STANDARD")
-	if obj.Metadata.ContentType != "" {
-		header.Set("Content-Type", obj.Metadata.ContentType)
-	} else {
-		header.Set("Content-Type", "application/octet-stream")
-	}
-	if obj.Metadata.ContentEncoding != "" {
-		header.Set("Content-Encoding", obj.Metadata.ContentEncoding)
-	}
-	if obj.Metadata.ContentDisposition != "" {
-		header.Set("Content-Disposition", obj.Metadata.ContentDisposition)
-	}
-	if obj.Metadata.ContentLanguage != "" {
-		header.Set("Content-Language", obj.Metadata.ContentLanguage)
-	}
-	if obj.Metadata.CacheControl != "" {
-		header.Set("Cache-Control", obj.Metadata.CacheControl)
-	}
-	if obj.Metadata.Expires != "" {
-		header.Set("Expires", obj.Metadata.Expires)
-	}
-	for key, value := range obj.Metadata.User {
-		header.Set("X-Amz-Meta-"+key, value)
-	}
-}
-
-func userMetadata(header http.Header) map[string]string {
-	metadata := make(map[string]string)
-	for key, values := range header {
-		if name, ok := strings.CutPrefix(strings.ToLower(key), "x-amz-meta-"); ok {
-			metadata[name] = strings.Join(values, ",")
-		}
-	}
-	if len(metadata) == 0 {
-		return nil
-	}
-	return metadata
-}
-
-func resolveRange(value string, size int64) (int64, int64, bool, error) {
-	if value == "" {
-		return 0, size, false, nil
-	}
-	spec, ok := strings.CutPrefix(strings.TrimSpace(value), "bytes=")
-	if !ok || strings.Contains(spec, ",") {
-		return 0, size, false, nil
-	}
-	left, right, ok := strings.Cut(spec, "-")
-	if !ok {
-		return 0, 0, false, errors.New("invalid range")
-	}
-	if left == "" {
-		suffix, err := strconv.ParseInt(right, 10, 64)
-		if err != nil || suffix <= 0 || size == 0 {
-			return 0, 0, false, errors.New("invalid range")
-		}
-		if suffix > size {
-			suffix = size
-		}
-		return size - suffix, suffix, true, nil
-	}
-	start, err := strconv.ParseInt(left, 10, 64)
-	if err != nil || start < 0 || start >= size {
-		return 0, 0, false, errors.New("invalid range")
-	}
-	end := size - 1
-	if right != "" {
-		end, err = strconv.ParseInt(right, 10, 64)
-		if err != nil || end < start {
-			return 0, 0, false, errors.New("invalid range")
-		}
-		if end >= size {
-			end = size - 1
-		}
-	}
-	return start, end - start + 1, true, nil
-}
-
-func checkReadConditions(r *http.Request, obj storage.Object) error {
-	etag := quoteETag(obj.ETag)
-	if value := r.Header.Get("If-Match"); value != "" && value != "*" && !strings.Contains(value, etag) {
-		return apiError("PreconditionFailed", http.StatusPreconditionFailed, "A precondition did not hold")
-	}
-	if value := r.Header.Get("If-None-Match"); value == "*" || (value != "" && strings.Contains(value, etag)) {
-		return apiError("NotModified", http.StatusNotModified, "Not Modified")
+	if op.srcBucket != "" && !key.CanAccess(op.srcBucket) {
+		return s3err.AccessDenied
 	}
 	return nil
 }
 
-func quoteETag(value string) string  { return "\"" + value + "\"" }
-func iso8601(value time.Time) string { return value.UTC().Format("2006-01-02T15:04:05.000Z") }
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
 
-func randomRequestID() string {
-	var raw [8]byte
-	_, _ = rand.Read(raw[:])
-	return strings.ToUpper(hex.EncodeToString(raw[:]))
+func (h *Handler) writeError(q *request, err error) {
+	e := s3err.As(err)
+	if e.Status >= 500 {
+		slog.Error("request failed", "method", q.r.Method, "path", q.r.URL.Path, "err", err)
+	}
+	if e.Status == http.StatusNotModified || q.r.Method == http.MethodHead {
+		q.w.WriteHeader(e.Status)
+		return
+	}
+	writeXML(q.w, e.Status, struct {
+		XMLName   xml.Name `xml:"Error"`
+		Code      string
+		Message   string
+		Resource  string
+		RequestID string `xml:"RequestId"`
+	}{Code: e.Code, Message: e.Message, Resource: q.r.URL.Path, RequestID: q.id})
+}
+
+func writeXML(w http.ResponseWriter, status int, v any) {
+	body, err := xml.Marshal(v)
+	if err != nil {
+		slog.Error("xml encode", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(body)))
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, xml.Header)
+	_, _ = w.Write(body)
+}
+
+func ok(w http.ResponseWriter, status int) error {
+	w.WriteHeader(status)
+	return nil
+}
+
+type owner struct {
+	ID          string
+	DisplayName string
+}
+
+var theOwner = owner{ID: "objex", DisplayName: "objex"}
+
+func iso8601(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
+func quote(etag string) string   { return `"` + etag + `"` }
+func setChecksum(h http.Header, c *checksum.Checksum) {
+	if c != nil {
+		h.Set(c.Algo.Header(), c.Value)
+		h.Set("X-Amz-Checksum-Type", string(c.Type()))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Request bodies
+// ---------------------------------------------------------------------------
+
+// body returns the request body, decoding aws-chunked when used.
+func (q *request) body() (io.Reader, *auth.ChunkedReader) {
+	if q.auth.Mode == auth.Streaming {
+		c := auth.NewChunkedReader(q.r.Body, q.auth.Chunks, q.auth.Trailer)
+		return c, c
+	}
+	return q.r.Body, nil
+}
+
+// expect builds the upload expectations from the request headers.
+func (q *request) expect(chunked *auth.ChunkedReader) (storage.Expect, error) {
+	e := storage.Expect{Size: q.r.ContentLength}
+	if v := q.header("Content-MD5"); v != "" {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v))
+		if err != nil || len(raw) != md5.Size {
+			return e, s3err.InvalidDigest
+		}
+		e.ContentMD5 = raw
+	}
+	for _, a := range checksum.All {
+		if v := q.header(a.Header()); v != "" {
+			if e.Checksum != nil {
+				return e, s3err.InvalidRequest.WithMessage("Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.")
+			}
+			c := checksum.Checksum{Algo: a, Value: strings.TrimSpace(v)}
+			if !c.Valid() || strings.Contains(c.Value, "-") {
+				return e, s3err.InvalidRequest.WithMessagef("Value for %s header is invalid.", a.Header())
+			}
+			e.Checksum = &c
+		}
+	}
+	named := q.header("X-Amz-Sdk-Checksum-Algorithm")
+	if named == "" {
+		named = q.header("X-Amz-Checksum-Algorithm")
+	}
+	if named != "" {
+		a, ok := checksum.Parse(named)
+		if !ok {
+			return e, s3err.InvalidRequest.WithMessage("Invalid checksum algorithm")
+		}
+		e.Algo = a
+	}
+	if t := q.header("X-Amz-Trailer"); t != "" {
+		a, ok := checksum.FromHeader(t)
+		if !ok {
+			return e, s3err.InvalidRequest.WithMessage("Unsupported trailer " + t)
+		}
+		e.Algo = a
+	}
+	if e.Checksum != nil && e.Algo != "" && e.Checksum.Algo != e.Algo {
+		return e, s3err.InvalidRequest.WithMessage("Value for x-amz-checksum-algorithm header is invalid.")
+	}
+	switch q.auth.Mode {
+	case auth.Streaming:
+		n, err := strconv.ParseInt(q.header("X-Amz-Decoded-Content-Length"), 10, 64)
+		if err != nil || n < 0 {
+			return e, s3err.MissingContentLength
+		}
+		e.Size = n
+		if chunked != nil {
+			e.Trailer = chunked.TrailingChecksum
+		}
+	case auth.SHA256:
+		e.SHA256 = q.auth.SHA256
+	}
+	if e.Size < 0 && len(q.r.TransferEncoding) == 0 {
+		return e, s3err.MissingContentLength
+	}
+	if e.Size > storage.MaxPutSize {
+		return e, s3err.EntityTooLarge
+	}
+	return e, nil
+}
+
+// readXML reads a small XML request body, verifying its SHA-256 and Content-MD5.
+func (q *request) readXML(v any) error {
+	data, err := q.readBody()
+	if err != nil {
+		return err
+	}
+	if err := xml.Unmarshal(data, v); err != nil {
+		return s3err.MalformedXML
+	}
+	return nil
+}
+
+func (q *request) readBody() ([]byte, error) {
+	body, _ := q.body()
+	data, err := io.ReadAll(io.LimitReader(body, maxXMLBody+1))
+	if err != nil {
+		var e *s3err.Error
+		if errors.As(err, &e) {
+			return nil, e
+		}
+		return nil, s3err.IncompleteBody
+	}
+	if len(data) > maxXMLBody {
+		return nil, s3err.InvalidRequest.WithMessage("Request body is too large")
+	}
+	if q.auth.Mode == auth.SHA256 {
+		if sum := sha256.Sum256(data); string(sum[:]) != string(q.auth.SHA256) {
+			return nil, s3err.XAmzContentSHA256Mismatch
+		}
+	}
+	if v := q.header("Content-MD5"); v != "" {
+		want, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v))
+		if sum := md5.Sum(data); err != nil || string(sum[:]) != string(want) {
+			return nil, s3err.BadDigest
+		}
+	}
+	return data, nil
+}
+
+func metadataFromHeaders(h http.Header) (storage.Metadata, error) {
+	m := storage.Metadata{
+		ContentType: h.Get("Content-Type"), ContentDisposition: h.Get("Content-Disposition"),
+		ContentLanguage: h.Get("Content-Language"), CacheControl: h.Get("Cache-Control"), Expires: h.Get("Expires"),
+	}
+	// aws-chunked is a transfer detail, not a property of the object.
+	var enc []string
+	for _, e := range strings.Split(h.Get("Content-Encoding"), ",") {
+		if e = strings.TrimSpace(e); e != "" && !strings.EqualFold(e, "aws-chunked") {
+			enc = append(enc, e)
+		}
+	}
+	m.ContentEncoding = strings.Join(enc, ",")
+	size := 0
+	for name, values := range h {
+		if n, ok := strings.CutPrefix(strings.ToLower(name), "x-amz-meta-"); ok {
+			if m.User == nil {
+				m.User = map[string]string{}
+			}
+			v := strings.Join(values, ",")
+			m.User[n] = v
+			size += len(n) + len(v)
+		}
+	}
+	if size > storage.MaxUserMeta {
+		return m, s3err.MetadataTooLarge
+	}
+	return m, nil
+}
+
+func parseMaxKeys(v, name string) (int, error) {
+	if v == "" {
+		return 1000, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, s3err.InvalidArgument.WithMessagef("Provided %s not an integer or within integer range", name)
+	}
+	return min(n, 1000), nil
 }
