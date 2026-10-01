@@ -246,6 +246,11 @@ go run ./cmd/objex-bench \
   -secret-key "$OBJEX_SECRET_KEY"
 ```
 
+Engineering reviews:
+
+- [Performance audit](PERFORMANCE_AUDIT.md)
+- [Efficiency audit](EFFICIENCY_AUDIT.md)
+
 ## License
 
 objex is source-available under the [Elastic License 2.0](LICENSE). Copyright
